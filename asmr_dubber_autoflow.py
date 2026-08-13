@@ -12,11 +12,12 @@ import tempfile
 import time
 import traceback
 import uuid
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from autoflow.catalog import (
     Edition,
@@ -160,6 +161,24 @@ class AudioSource:
     source_language: str = "ja"
 
 
+@dataclass(frozen=True)
+class SmartTaskPlan:
+    """A fully configured smart-scan task that has not started processing yet."""
+
+    folder: Path
+    output_root: Path
+    edition_label: str
+    sources: tuple[AudioSource, ...]
+    edition: dict[str, Any]
+    mode: str
+    layout: str
+    background: Path | None
+    embed_subtitles: bool
+    plan_id: str
+    rebuild: bool
+    force: bool
+
+
 def print_header() -> None:
     print()
     print("=" * 68)
@@ -190,6 +209,25 @@ def append_log(text: str) -> None:
 
 def log_event(message: str) -> None:
     append_log(f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] {message}\n")
+
+
+def parse_yes_no(value: str) -> bool | None:
+    normalized = value.strip().casefold()
+    if normalized == "y":
+        return True
+    if normalized == "n":
+        return False
+    return None
+
+
+def ask_yes_no(prompt: str) -> bool:
+    """Ask an explicit question and accept only Y or N."""
+
+    while True:
+        answer = parse_yes_no(input(prompt))
+        if answer is not None:
+            return answer
+        print("输入无效，请输入 Y 或 N。")
 
 
 def normalize_mode(value: Any) -> str:
@@ -714,7 +752,9 @@ def choose_tracks(
                     f"{category_label(name)} {count} 轨" for name, count in counts.items()
                 )
             )
-            include_optional = input("是否一并处理？输入 Y 确认：").strip().casefold() == "y"
+            include_optional = ask_yes_no(
+                "是否包含这些附加音轨？输入 Y 包含，输入 N 不包含："
+            )
     if include_optional:
         candidates.extend(optional_pool)
         candidates.sort(key=lambda item: (item.order_key, natural_key(item.relative_path)))
@@ -822,6 +862,25 @@ def ask_output_layout(config: AppConfig, argument: str | None = None) -> str:
         print("输入无效，请重新选择。")
 
 
+def parse_embed_subtitles_argument(value: str) -> bool:
+    normalized = value.strip().casefold()
+    if normalized == "yes":
+        return True
+    if normalized == "no":
+        return False
+    raise VideoPreparerError(f"未知的字幕内嵌选项：{value}")
+
+
+def ask_embed_subtitles(mode: str, argument: str | None = None) -> bool:
+    if normalize_mode(mode) == MODE_AUDIO:
+        return False
+    if argument is not None:
+        return parse_embed_subtitles_argument(argument)
+    print("\n是否把字幕放进最终视频？")
+    print("  无论如何都会另外保留双语版.srt 和双语版.lrc。")
+    return ask_yes_no("输入 Y 内嵌字幕，输入 N 仅保留外部字幕：")
+
+
 def file_stat_payload(path: Path | None) -> dict[str, Any] | None:
     if path is None:
         return None
@@ -906,6 +965,7 @@ def plan_identity(
     sources: list[AudioSource],
     output_root: Path | None = None,
     background: Path | None = None,
+    embed_subtitles: bool = True,
 ) -> str:
     payload = {
         "source_folder": os.path.normcase(str(source_folder.resolve())),
@@ -925,6 +985,10 @@ def plan_identity(
             for item in sources
         ],
     }
+    # Keep the original identity for the historical/default behaviour so
+    # existing completed and resumable plans remain usable after upgrading.
+    if normalize_mode(mode) != MODE_AUDIO and not embed_subtitles:
+        payload["embed_subtitles"] = False
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
@@ -964,6 +1028,7 @@ def write_plan_manifest(
     edition: dict[str, Any],
     sources: list[AudioSource],
     background: Path | None,
+    embed_subtitles: bool,
     plan_id: str | None = None,
     jobs: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -977,6 +1042,7 @@ def write_plan_manifest(
         "layout": normalize_layout(layout),
         "edition": edition,
         "background": str(background) if background else None,
+        "embed_subtitles": bool(embed_subtitles),
         "tracks": [
             {
                 "index": index,
@@ -1017,6 +1083,7 @@ def load_state(path: Path) -> dict[str, Any] | None:
     payload.setdefault(
         "harmonized_delay_seconds", round(DEFAULT_HARMONIZED_DELAY_MINUTES * 60)
     )
+    payload.setdefault("embed_subtitles", True)
     return payload
 
 
@@ -1415,7 +1482,7 @@ def render_delayed_existing_video(
     destination: Path,
     *,
     lead_seconds: int,
-    subtitle_file: Path,
+    subtitle_file: Path | None,
     volume_db: float = 0.0,
     audio_source: Path | None = None,
 ) -> None:
@@ -1431,7 +1498,6 @@ def render_delayed_existing_video(
         (f"adelay={lead_seconds * 1000}:all=1", "asetpts=N/SR/TB")
     )
     audio_input_index = 1 if audio_source is not None else 0
-    subtitle_input_index = 2 if audio_source is not None else 1
     filter_complex = (
         f"[0:v:0]tpad=start_mode=clone:start_duration={lead_seconds},"
         f"scale={VIDEO_FILTER_SIZE}:force_original_aspect_ratio=decrease,"
@@ -1442,7 +1508,22 @@ def render_delayed_existing_video(
     input_arguments = ["-i", str(source)]
     if audio_source is not None:
         input_arguments.extend(("-i", str(audio_source)))
-    input_arguments.extend(("-f", "srt", "-i", str(subtitle_file)))
+    subtitle_input_index: int | None = None
+    if subtitle_file is not None:
+        subtitle_input_index = 2 if audio_source is not None else 1
+        input_arguments.extend(("-f", "srt", "-i", str(subtitle_file)))
+    subtitle_arguments = (
+        [
+            "-map",
+            f"{subtitle_input_index}:s:0",
+            "-c:s",
+            "mov_text",
+            "-metadata:s:s:0",
+            "language=zho",
+        ]
+        if subtitle_input_index is not None
+        else ["-sn"]
+    )
     try:
         run_ffmpeg(
             paths,
@@ -1459,8 +1540,7 @@ def render_delayed_existing_video(
                 "[v]",
                 "-map",
                 "[a]",
-                "-map",
-                f"{subtitle_input_index}:s:0",
+                *subtitle_arguments,
                 *paths.video_encoder_options,
                 "-r",
                 str(VIDEO_FPS),
@@ -1474,10 +1554,6 @@ def render_delayed_existing_video(
                 str(SAMPLE_RATE),
                 "-ac",
                 "2",
-                "-c:s",
-                "mov_text",
-                "-metadata:s:s:0",
-                "language=zho",
                 "-pix_fmt",
                 "yuv420p",
                 "-movflags",
@@ -2114,6 +2190,56 @@ def remux_video_with_subtitle(
     raise VideoPreparerError("无法把 ASMR Dubber 的字幕视频转换成 MP4：" + "；".join(failures))
 
 
+def remux_video_without_subtitles(
+    paths: ToolPaths,
+    source: Path,
+    destination: Path,
+) -> None:
+    """Create an MP4 with video and audio only, stripping every subtitle stream."""
+
+    attempts = (
+        ["-c:v", "copy"],
+        [*paths.video_encoder_options, "-pix_fmt", "yuv420p"],
+    )
+    failures: list[str] = []
+    for video_options in attempts:
+        partial = partial_output_path(destination)
+        try:
+            run_ffmpeg(
+                paths,
+                [
+                    "-loglevel",
+                    "warning",
+                    "-i",
+                    str(source),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a:0",
+                    "-sn",
+                    *video_options,
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "256k",
+                    "-ar",
+                    str(SAMPLE_RATE),
+                    "-ac",
+                    "2",
+                    "-movflags",
+                    "+faststart",
+                    str(partial),
+                ],
+            )
+            os.replace(partial, destination)
+            return
+        except VideoPreparerError as exc:
+            failures.append(str(exc))
+        finally:
+            partial.unlink(missing_ok=True)
+    raise VideoPreparerError("无法生成不含字幕的 MP4：" + "；".join(failures))
+
+
 def copy_final_outputs(
     paths: ToolPaths,
     project_json: Path,
@@ -2122,6 +2248,7 @@ def copy_final_outputs(
     *,
     harmonized_delay_seconds: int,
     harmonized_volume_db: float,
+    embed_subtitles: bool,
 ) -> dict[str, str]:
     project = read_project(project_json)
     mode = normalize_mode(mode)
@@ -2150,16 +2277,20 @@ def copy_final_outputs(
         # Do not freeze the first frame of a hard-subtitled video for 20 minutes.
         # Delay the clean mixed video, then attach the already shifted subtitle.
         video_source = project_asset(project_json, project.get("output_video_file"))
-        if video_source is None:
+        if video_source is None and embed_subtitles:
             video_source = project_asset(project_json, project.get("subtitle_video_file"))
         # Use ASMR Dubber's lossless mixed WAV as the final audio source. The
         # delayed harmonious version is then encoded to AAC only once.
         mixed_audio_source = project_asset(project_json, project.get("output_file"))
-    else:
+    elif embed_subtitles:
         video_source = project_asset(project_json, project.get("subtitle_video_file"))
         if video_source is None:
             video_source = project_asset(project_json, project.get("output_video_file"))
+    else:
+        video_source = project_asset(project_json, project.get("output_video_file"))
     if video_source is None:
+        if not embed_subtitles:
+            raise VideoPreparerError("ASMR Dubber 没有生成可用的无字幕双语视频。")
         raise VideoPreparerError("ASMR Dubber 没有生成可用的双语视频。")
 
     srt, lrc = copy_subtitles(
@@ -2176,12 +2307,14 @@ def copy_final_outputs(
             video_source,
             video_destination,
             lead_seconds=harmonized_delay_seconds,
-            subtitle_file=srt,
+            subtitle_file=srt if embed_subtitles else None,
             volume_db=harmonized_volume_db,
             audio_source=mixed_audio_source,
         )
     else:
-        if video_source.suffix.casefold() == ".mp4":
+        if not embed_subtitles:
+            remux_video_without_subtitles(paths, video_source, video_destination)
+        elif video_source.suffix.casefold() == ".mp4":
             atomic_copy(video_source, video_destination)
         else:
             remux_video_with_subtitle(paths, video_source, srt, video_destination)
@@ -2804,6 +2937,8 @@ def create_initial_state(
     sources: list[AudioSource],
     background: Path | None,
     config: AppConfig,
+    *,
+    embed_subtitles: bool = True,
 ) -> dict[str, Any]:
     mode = normalize_mode(mode)
     return {
@@ -2816,6 +2951,7 @@ def create_initial_state(
         "status": "",
         "fingerprint": fingerprint(sources, background),
         "background": str(background) if background else None,
+        "embed_subtitles": bool(embed_subtitles),
         "workspace": str(workspace_path(folder)),
         "timeline": [],
         "title_translations": {},
@@ -2839,6 +2975,7 @@ def create_planned_state(
     job_id: str,
     folder_translation: str,
     title_translations: dict[str, str],
+    embed_subtitles: bool,
 ) -> dict[str, Any]:
     state = create_initial_state(
         output_folder,
@@ -2846,6 +2983,7 @@ def create_planned_state(
         sources,
         background,
         config,
+        embed_subtitles=embed_subtitles,
     )
     state.update(
         {
@@ -2877,6 +3015,7 @@ def execute_planned_job(
     job_id: str,
     folder_translation: str,
     title_translations: dict[str, str],
+    embed_subtitles: bool,
     rebuild: bool,
     shared_reference: dict[str, str] | None = None,
     capture_reference_path: Path | None = None,
@@ -2890,6 +3029,12 @@ def execute_planned_job(
         if state.get("fingerprint") != current_fingerprint:
             raise VideoPreparerError(
                 f"{output_folder.name} 的源音频、字幕或背景发生变化；请使用 --rebuild 重做。"
+            )
+        if normalize_mode(mode) != MODE_AUDIO and bool(
+            state.get("embed_subtitles", True)
+        ) != bool(embed_subtitles):
+            raise VideoPreparerError(
+                f"{output_folder.name} 的字幕内嵌设置发生变化；请使用 --rebuild 重做。"
             )
         missing = missing_resume_artifacts(state, output_folder)
         if missing:
@@ -2924,6 +3069,7 @@ def execute_planned_job(
             job_id=job_id,
             folder_translation=folder_translation,
             title_translations=title_translations,
+            embed_subtitles=embed_subtitles,
         )
         save_state(state_file, state)
 
@@ -3147,6 +3293,7 @@ def build_merged_outputs(
     background: Path | None,
     folder_translation: str,
     title_translations: dict[str, str],
+    embed_subtitles: bool,
 ) -> dict[str, str]:
     """Build the merged product from completed per-track projects."""
 
@@ -3235,15 +3382,25 @@ def build_merged_outputs(
             lead_seconds=lead,
             volume_db=volume,
         )
-        render_static_bilingual_video(
-            paths,
-            mixed_master,
-            background,
-            srt,
-            bilingual_destination,
-            lead_seconds=lead,
-            volume_db=volume,
-        )
+        if embed_subtitles:
+            render_static_bilingual_video(
+                paths,
+                mixed_master,
+                background,
+                srt,
+                bilingual_destination,
+                lead_seconds=lead,
+                volume_db=volume,
+            )
+        else:
+            render_static_video(
+                paths,
+                mixed_master,
+                background,
+                bilingual_destination,
+                lead_seconds=lead,
+                volume_db=volume,
+            )
         outputs = {
             "original": str(original_destination),
             "video": str(bilingual_destination),
@@ -3346,8 +3503,7 @@ def output_mapping_complete(outputs: Any, *, mode: str) -> bool:
     return all(Path(str(outputs.get(key) or "")).is_file() for key in required)
 
 
-def execute_smart_plan(
-    paths: ToolPaths,
+def prepare_smart_plan(
     config: AppConfig,
     folder: Path,
     *,
@@ -3357,10 +3513,11 @@ def execute_smart_plan(
     include_bonus: bool,
     output_root_argument: str | None,
     background_argument: str | None,
+    embed_subtitles_argument: str | None,
     rebuild: bool,
     force: bool,
-) -> None:
-    """Run the recursive DLsite catalogue workflow."""
+) -> SmartTaskPlan:
+    """Scan and configure a DLsite task without running models or translating."""
 
     if not folder.is_dir():
         raise VideoPreparerError(f"文件夹不存在：{folder}")
@@ -3391,6 +3548,7 @@ def execute_smart_plan(
         if mode != MODE_AUDIO
         else None
     )
+    embed_subtitles = ask_embed_subtitles(mode, embed_subtitles_argument)
     plan_id = plan_identity(
         folder,
         mode=mode,
@@ -3399,10 +3557,58 @@ def execute_smart_plan(
         sources=sources,
         output_root=output_root,
         background=background,
+        embed_subtitles=embed_subtitles,
     )
+    return SmartTaskPlan(
+        folder=folder.resolve(),
+        output_root=output_root,
+        edition_label=edition_label,
+        sources=tuple(sources),
+        edition=edition,
+        mode=mode,
+        layout=layout,
+        background=background,
+        embed_subtitles=embed_subtitles,
+        plan_id=plan_id,
+        rebuild=rebuild,
+        force=force,
+    )
+
+
+def print_smart_plan_summary(plan: SmartTaskPlan, *, index: int | None = None) -> None:
+    heading = f"作品 {index}" if index is not None else "本作品"
+    print(f"\n{heading}已配置：{plan.folder.name}")
+    print(f"  音频版本：{plan.edition_label}（{len(plan.sources)} 轨）")
+    print(f"  处理类型：{mode_label(plan.mode)}")
+    print(f"  成品组织：{layout_label(plan.layout)}")
+    if plan.mode != MODE_AUDIO:
+        print(f"  背景图片：{plan.background.name if plan.background else '黑色背景'}")
+        print(f"  视频字幕：{'内嵌，同时保留 SRT/LRC' if plan.embed_subtitles else '不内嵌，仅保留 SRT/LRC'}")
+    print(f"  输出目录：{plan.output_root}")
+
+
+def execute_prepared_smart_plan(
+    paths: ToolPaths,
+    config: AppConfig,
+    plan: SmartTaskPlan,
+) -> None:
+    """Execute a previously configured smart task without asking plan questions."""
+
+    folder = plan.folder
+    output_root = plan.output_root
+    edition_label = plan.edition_label
+    sources = list(plan.sources)
+    edition = plan.edition
+    mode = plan.mode
+    layout = plan.layout
+    background = plan.background
+    embed_subtitles = plan.embed_subtitles
+    plan_id = plan.plan_id
+    rebuild = plan.rebuild
+    force = plan.force
     log_event(
         f"开始智能任务 plan={plan_id} source={folder} mode={mode} layout={layout} "
-        f"tracks={len(sources)}"
+        f"tracks={len(sources)} embed_subtitles={embed_subtitles}"
     )
     prepare_smart_output_root(output_root, plan_id=plan_id, force=force, rebuild=rebuild)
 
@@ -3413,6 +3619,7 @@ def execute_smart_plan(
             print(f"背景图片：{background.name}")
         else:
             print("背景图片：黑色背景")
+        print(f"视频字幕：{'内嵌' if embed_subtitles else '不内嵌（外部 SRT/LRC 仍保留）'}")
 
     folder_translation, title_translations = translated_plan_titles(
         plan_id,
@@ -3430,6 +3637,7 @@ def execute_smart_plan(
         edition=edition,
         sources=list(sources),
         background=background,
+        embed_subtitles=embed_subtitles,
         plan_id=plan_id,
         jobs=descriptors,
     )
@@ -3455,6 +3663,7 @@ def execute_smart_plan(
             "layout": layout,
             "edition": edition,
             "background": str(background) if background else None,
+            "embed_subtitles": embed_subtitles,
             "jobs": descriptors,
         }
     )
@@ -3483,6 +3692,7 @@ def execute_smart_plan(
             job_id="merged",
             folder_translation=folder_translation,
             title_translations=title_translations,
+            embed_subtitles=embed_subtitles,
             rebuild=rebuild,
         )
         states_by_index = {index: state for index in range(1, len(sources) + 1)}
@@ -3511,6 +3721,7 @@ def execute_smart_plan(
                 job_id=str(descriptor["job_id"]),
                 folder_translation=folder_translation,
                 title_translations=title_translations,
+                embed_subtitles=embed_subtitles,
                 rebuild=rebuild,
                 shared_reference=shared_reference,
                 capture_reference_path=capture,
@@ -3559,6 +3770,7 @@ def execute_smart_plan(
                 background=background,
                 folder_translation=folder_translation,
                 title_translations=title_translations,
+                embed_subtitles=embed_subtitles,
             )
             merged_descriptor["outputs"] = merged_outputs
             merged_descriptor["status"] = "completed"
@@ -3631,6 +3843,40 @@ def execute_smart_plan(
     log_event(f"智能任务完成 plan={plan_id} output={output_root}")
     print("\n智能任务完成。源作品文件没有被修改。")
     print(f"所有成品位于：{output_root}")
+
+
+def execute_smart_plan(
+    paths: ToolPaths,
+    config: AppConfig,
+    folder: Path,
+    *,
+    mode_argument: str | None,
+    layout_argument: str | None,
+    edition_argument: str | None,
+    include_bonus: bool,
+    output_root_argument: str | None,
+    background_argument: str | None,
+    embed_subtitles_argument: str | None,
+    rebuild: bool,
+    force: bool,
+) -> None:
+    """Compatibility wrapper for a single recursive DLsite task."""
+
+    plan = prepare_smart_plan(
+        config,
+        folder,
+        mode_argument=mode_argument,
+        layout_argument=layout_argument,
+        edition_argument=edition_argument,
+        include_bonus=include_bonus,
+        output_root_argument=output_root_argument,
+        background_argument=background_argument,
+        embed_subtitles_argument=embed_subtitles_argument,
+        rebuild=rebuild,
+        force=force,
+    )
+    print_smart_plan_summary(plan)
+    execute_prepared_smart_plan(paths, config, plan)
 
 
 def missing_resume_artifacts(state: dict[str, Any], folder: Path) -> list[Path]:
@@ -3847,6 +4093,7 @@ def execute_task(
             str(state["mode"]),
             harmonized_delay_seconds=int(state["harmonized_delay_seconds"]),
             harmonized_volume_db=float(state["harmonized_volume_db"]),
+            embed_subtitles=bool(state.get("embed_subtitles", True)),
         )
         state["status"] = "outputs_ready"
         save_state(state_file, state)
@@ -3894,6 +4141,7 @@ def prepare_or_resume(
     config: AppConfig,
     folder: Path,
     mode_argument: str | None,
+    embed_subtitles_argument: str | None,
     *,
     rebuild: bool,
     force: bool,
@@ -3906,9 +4154,17 @@ def prepare_or_resume(
     requested_mode = normalize_mode(mode_argument) if mode_argument else None
 
     if state is not None and not rebuild:
+        stored_embed_subtitles = bool(state.get("embed_subtitles", True))
         state_mode = normalize_mode(state["mode"])
         if requested_mode is not None and requested_mode != state_mode:
             raise VideoPreparerError("现有任务模式与 --mode 不一致；如需更换，请使用 --rebuild。")
+        if embed_subtitles_argument is not None:
+            requested_embed = parse_embed_subtitles_argument(embed_subtitles_argument)
+            if state_mode != MODE_AUDIO and requested_embed != stored_embed_subtitles:
+                raise VideoPreparerError(
+                    "现有任务的字幕内嵌设置与 --embed-subtitles 不一致；"
+                    "如需更换，请使用 --rebuild。"
+                )
         background = discover_background(folder) if state_mode != MODE_AUDIO else None
         current_fingerprint = fingerprint(sources, background)
     else:
@@ -3952,12 +4208,20 @@ def prepare_or_resume(
 
     if state is None or rebuild:
         mode = requested_mode or ask_mode(config)
+        embed_subtitles = ask_embed_subtitles(mode, embed_subtitles_argument)
         background = discover_background(folder) if mode != MODE_AUDIO else None
         current_fingerprint = fingerprint(sources, background)
         confirm_overwrite(folder, mode, force=force)
         workspace = workspace_path(folder)
         safe_reset_workspace(workspace)
-        state = create_initial_state(folder, mode, sources, background, config)
+        state = create_initial_state(
+            folder,
+            mode,
+            sources,
+            background,
+            config,
+            embed_subtitles=embed_subtitles,
+        )
         save_state(state_file, state)
 
     print("\n将按以下顺序处理：")
@@ -3966,6 +4230,11 @@ def prepare_or_resume(
     if normalize_mode(state["mode"]) != MODE_AUDIO:
         print(f"背景：{background.name if background else '未找到 null 图片，使用黑色背景'}")
     print(f"模式：{mode_label(state['mode'])}")
+    if normalize_mode(state["mode"]) != MODE_AUDIO:
+        print(
+            "视频字幕："
+            + ("内嵌，同时保留 SRT/LRC" if state.get("embed_subtitles", True) else "不内嵌，仅保留 SRT/LRC")
+        )
     execute_task(paths, folder, state_file, state, sources)
 
 
@@ -4026,6 +4295,34 @@ def video_keyframe_times(paths: ToolPaths, media: Path) -> list[float]:
         ]
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise VideoPreparerError(f"关键帧信息无效：{media}") from exc
+
+
+def media_stream_types(paths: ToolPaths, media: Path) -> list[str]:
+    command = [
+        str(paths.ffprobe),
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "json",
+        str(media),
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise VideoPreparerError(f"无法检查媒体流：{media}")
+    try:
+        streams = json.loads(result.stdout).get("streams") or []
+        return [str(item["codec_type"]) for item in streams]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise VideoPreparerError(f"媒体流信息无效：{media}") from exc
 
 
 def self_test(paths: ToolPaths) -> None:
@@ -4091,6 +4388,14 @@ def self_test(paths: ToolPaths) -> None:
             or _background_from_argument(smart_scan, "0") is not None
         ):
             raise VideoPreparerError("自检失败：推荐背景、编号选择或黑色背景错误。")
+        if (
+            parse_yes_no("Y") is not True
+            or parse_yes_no("n") is not False
+            or parse_yes_no("") is not None
+            or parse_embed_subtitles_argument("yes") is not True
+            or parse_embed_subtitles_argument("no") is not False
+        ):
+            raise VideoPreparerError("自检失败：Y/N 或字幕选项解析错误。")
         smart_sources = [
             source_from_candidate(index, item)
             for index, item in enumerate(smart_scan.editions[0].tracks, start=1)
@@ -4103,6 +4408,56 @@ def self_test(paths: ToolPaths) -> None:
             or len(smart_job_descriptors(root / "out", LAYOUT_BOTH, smart_sources)) != 4
         ):
             raise VideoPreparerError("自检失败：三种输出布局的任务规划错误。")
+        queue_plan_base = {
+            "output_root": root / "queue-output",
+            "edition_label": "测试版本",
+            "sources": tuple(smart_sources),
+            "edition": {},
+            "mode": MODE_AUDIO,
+            "layout": LAYOUT_MERGED,
+            "background": None,
+            "embed_subtitles": False,
+            "rebuild": False,
+            "force": False,
+        }
+        queue_plans = [
+            SmartTaskPlan(
+                folder=root / "queue-first",
+                plan_id="queue-first",
+                **queue_plan_base,
+            ),
+            SmartTaskPlan(
+                folder=root / "queue-second",
+                plan_id="queue-second",
+                **{**queue_plan_base, "output_root": root / "queue-output-2"},
+            ),
+        ]
+        queue_calls: list[str] = []
+
+        def fake_queue_executor(
+            _paths: ToolPaths,
+            _config: AppConfig,
+            task: SmartTaskPlan,
+        ) -> None:
+            queue_calls.append(task.plan_id)
+            if task.plan_id == "queue-first":
+                raise VideoPreparerError("预期的队列测试失败")
+
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as sink:
+            with redirect_stdout(sink), redirect_stderr(sink):
+                queue_result = execute_smart_queue(
+                    paths,
+                    AppConfig(
+                        asmr_root=None,
+                        harmonized_volume_db=-10.0,
+                        harmonized_delay_seconds=1_200,
+                        timestamp_footer="",
+                    ),
+                    queue_plans,
+                    executor=fake_queue_executor,
+                )
+        if queue_result != 1 or queue_calls != ["queue-first", "queue-second"]:
+            raise VideoPreparerError("自检失败：队列没有在单项失败后继续处理。")
         workspace = root / "work"
         workspace.mkdir()
         master, timeline = normalize_and_concat(paths, discovered, workspace)
@@ -4239,6 +4594,7 @@ def self_test(paths: ToolPaths) -> None:
             MODE_AUDIO,
             harmonized_delay_seconds=1_200,
             harmonized_volume_db=-10.0,
+            embed_subtitles=False,
         )
         if not all(Path(path).is_file() for path in audio_outputs.values()):
             raise VideoPreparerError("自检失败：纯音频模式最终文件回写错误。")
@@ -4312,6 +4668,25 @@ def self_test(paths: ToolPaths) -> None:
             raise VideoPreparerError(
                 f"自检失败：双语视频前导时长异常 {delayed_duration - normal_duration:.3f}s"
             )
+        if "subtitle" not in media_stream_types(paths, delayed):
+            raise VideoPreparerError("自检失败：开启字幕后视频中没有字幕流。")
+        delayed_without_subtitle = root / "delayed-without-subtitle.mp4"
+        render_delayed_existing_video(
+            paths,
+            normal,
+            delayed_without_subtitle,
+            lead_seconds=2,
+            subtitle_file=None,
+            volume_db=test_harmonized_volume_db,
+            audio_source=master,
+        )
+        if "subtitle" in media_stream_types(paths, delayed_without_subtitle):
+            raise VideoPreparerError("自检失败：关闭字幕后视频仍包含字幕流。")
+        remuxed_without_subtitle = root / "remuxed-without-subtitle.mp4"
+        remux_video_without_subtitles(paths, delayed, remuxed_without_subtitle)
+        remuxed_streams = media_stream_types(paths, remuxed_without_subtitle)
+        if "subtitle" in remuxed_streams or not {"video", "audio"}.issubset(remuxed_streams):
+            raise VideoPreparerError("自检失败：无字幕重封装的媒体流错误。")
         sample_lrc = "[00:01.25]测试\n"
         if "[20:01.25]" not in shift_lrc_text(sample_lrc, 1_200_000):
             raise VideoPreparerError("自检失败：LRC 偏移错误。")
@@ -4378,8 +4753,120 @@ def build_parser() -> argparse.ArgumentParser:
             "或 black；交互运行默认显示全部图片供选择"
         ),
     )
+    parser.add_argument(
+        "--embed-subtitles",
+        choices=("yes", "no"),
+        help="视频是否内嵌字幕；无论如何都会保留外部 SRT/LRC",
+    )
     parser.add_argument("--self-test", action="store_true", help="只运行几秒钟的本地媒体自检")
     return parser
+
+
+def collect_interactive_smart_plans(
+    config: AppConfig,
+    args: argparse.Namespace,
+) -> list[SmartTaskPlan]:
+    """Configure every queued work before the first one starts processing."""
+
+    plans: list[SmartTaskPlan] = []
+    configured_folders: set[Path] = set()
+    while True:
+        number = len(plans) + 1
+        folder = clean_user_path(input(f"请粘贴第 {number} 个作品文件夹路径："))
+        resolved = folder.resolve()
+        if resolved in configured_folders:
+            print("这个作品已经在任务列表中，请换一个文件夹。")
+            continue
+        plan = prepare_smart_plan(
+            config,
+            folder,
+            mode_argument=args.mode,
+            layout_argument=args.layout,
+            edition_argument=args.edition,
+            include_bonus=args.include_bonus,
+            output_root_argument=args.output_root,
+            background_argument=args.background,
+            embed_subtitles_argument=args.embed_subtitles,
+            rebuild=args.rebuild,
+            force=args.force,
+        )
+        if any(existing.output_root == plan.output_root for existing in plans):
+            raise VideoPreparerError(
+                f"两个作品不能使用同一个输出目录：{plan.output_root}"
+            )
+        plans.append(plan)
+        configured_folders.add(resolved)
+        print_smart_plan_summary(plan, index=number)
+        if not ask_yes_no("\n是否添加下一个 DLsite 作品？输入 Y 添加，输入 N 开始处理："):
+            break
+    return plans
+
+
+def execute_smart_queue(
+    paths: ToolPaths,
+    config: AppConfig,
+    plans: Sequence[SmartTaskPlan],
+    *,
+    executor: Callable[[ToolPaths, AppConfig, SmartTaskPlan], None] | None = None,
+) -> int:
+    """Run configured works in order, retaining failures and continuing the queue."""
+
+    print(f"\n全部 {len(plans)} 个作品已经配置完成，现在按顺序开始处理。")
+    run_plan = executor or execute_prepared_smart_plan
+    failures: list[tuple[SmartTaskPlan, str]] = []
+    for index, plan in enumerate(plans, start=1):
+        print("\n" + "=" * 68)
+        print(f"  队列 {index}/{len(plans)} · {plan.folder.name}")
+        print("=" * 68)
+        try:
+            run_plan(paths, config, plan)
+        except KeyboardInterrupt:
+            raise
+        except VideoPreparerError as exc:
+            message = str(exc)
+            failures.append((plan, message))
+            log_event(
+                f"队列任务失败 source={plan.folder} error={message}；继续下一项"
+            )
+            print(f"\n这个作品处理失败：{message}", file=sys.stderr)
+            print("已有状态和成品已保留，继续处理下一个作品。", file=sys.stderr)
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            failures.append((plan, message))
+            log_event(
+                f"队列任务未预期失败 source={plan.folder} error={message}；继续下一项"
+            )
+            append_log(traceback.format_exc())
+            print(f"\n这个作品发生未预期错误：{message}", file=sys.stderr)
+            print("已有状态和成品已保留，继续处理下一个作品。", file=sys.stderr)
+
+    succeeded = len(plans) - len(failures)
+    print("\n" + "=" * 68)
+    print(f"队列结束：成功 {succeeded} 个，失败 {len(failures)} 个。")
+    if failures:
+        print("失败项目：", file=sys.stderr)
+        for plan, message in failures:
+            print(f"  - {plan.folder}: {message}", file=sys.stderr)
+        print(f"详细日志：{LOG_FILE}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def validate_interactive_queue_arguments(args: argparse.Namespace) -> None:
+    """Reject per-work overrides that cannot safely be shared by an ad-hoc queue."""
+
+    unsupported: list[str] = []
+    if args.edition:
+        unsupported.append("--edition")
+    if args.output_root:
+        unsupported.append("--output-root")
+    if args.background:
+        unsupported.append("--background")
+    if unsupported:
+        joined = "、".join(unsupported)
+        raise VideoPreparerError(
+            f"多作品交互队列不支持 {joined}；这些参数只适合指定单个文件夹时使用。"
+        )
 
 
 def main() -> int:
@@ -4393,10 +4880,10 @@ def main() -> int:
         if args.self_test:
             self_test(paths)
             return 0
-        folder = clean_user_path(args.folder) if args.folder else clean_user_path(
-            input("请粘贴解压后的作品文件夹路径：")
-        )
         if args.scan == "legacy":
+            folder = clean_user_path(args.folder) if args.folder else clean_user_path(
+                input("请粘贴解压后的作品文件夹路径：")
+            )
             if (
                 args.layout
                 or args.edition
@@ -4413,10 +4900,12 @@ def main() -> int:
                 config,
                 folder,
                 args.mode,
+                args.embed_subtitles,
                 rebuild=args.rebuild,
                 force=args.force,
             )
-        else:
+        elif args.folder:
+            folder = clean_user_path(args.folder)
             execute_smart_plan(
                 paths,
                 config,
@@ -4427,9 +4916,14 @@ def main() -> int:
                 include_bonus=args.include_bonus,
                 output_root_argument=args.output_root,
                 background_argument=args.background,
+                embed_subtitles_argument=args.embed_subtitles,
                 rebuild=args.rebuild,
                 force=args.force,
             )
+        else:
+            validate_interactive_queue_arguments(args)
+            plans = collect_interactive_smart_plans(config, args)
+            return execute_smart_queue(paths, config, plans)
         return 0
     except KeyboardInterrupt:
         log_event("用户取消任务")
