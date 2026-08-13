@@ -105,6 +105,7 @@ STATUS_ORDER = {
 
 TITLE_TRANSLATION_PROMPT = """你负责把日语作品文件夹名称和音频曲目标题翻译成自然、简洁的简体中文。
 保留人物名、编号、括号、符号和作品专有名词，不要省略成人内容，不要解释。
+如果输入只是 RJ、VJ、BJ 等作品编号，译文原样保留该编号。
 每个输入 id 必须输出一项，顺序和 id 必须完全一致，译文不得为空。
 只输出严格 JSON：
 {"translations":[{"id":"title0001","zh":"中文标题"}]}"""
@@ -128,7 +129,7 @@ class AppConfig:
     default_output_layout: str = "ask"
     preferred_audio_formats: tuple[str, ...] = (".wav", ".flac", ".ape", ".m4a", ".mp3")
     bonus_policy: str = "ask"
-    background_policy: str = "auto"
+    background_policy: str = "ask"
 
 
 @dataclass(frozen=True)
@@ -313,9 +314,9 @@ def load_app_config(path: Path = SETTINGS_FILE) -> AppConfig:
     bonus_policy = values.get("bonus_policy", "ask").strip().casefold()
     if bonus_policy not in {"ask", "include", "exclude"}:
         raise VideoPreparerError("bonus_policy 必须是 ask、include 或 exclude。")
-    background_policy = values.get("background_policy", "auto").strip().casefold()
-    if background_policy not in {"auto", "black"}:
-        raise VideoPreparerError("background_policy 必须是 auto 或 black。")
+    background_policy = values.get("background_policy", "ask").strip().casefold()
+    if background_policy not in {"ask", "auto", "black"}:
+        raise VideoPreparerError("background_policy 必须是 ask、auto 或 black。")
     return AppConfig(
         asmr_root=asmr_root,
         harmonized_volume_db=-abs(reduction),
@@ -738,10 +739,59 @@ def choose_tracks(
     )
 
 
-def smart_background(scan: ScanResult, config: AppConfig) -> Path | None:
-    if config.background_policy == "black" or not scan.images:
+def _background_from_argument(scan: ScanResult, value: str) -> Path | None:
+    answer = value.strip().strip('"').strip("'")
+    normalized = answer.casefold()
+    if normalized in {"0", "black", "none"}:
         return None
-    return scan.images[0].resolve()
+    if normalized == "auto":
+        return scan.images[0].resolve() if scan.images else None
+    if answer.isdigit():
+        index = int(answer)
+        if 1 <= index <= len(scan.images):
+            return scan.images[index - 1].resolve()
+        raise VideoPreparerError(f"背景图片编号超出范围：{answer}")
+
+    candidate = Path(answer).expanduser()
+    if not candidate.is_absolute():
+        candidate = scan.root / candidate
+    candidate = candidate.resolve()
+    available = {path.resolve() for path in scan.images}
+    if candidate not in available:
+        raise VideoPreparerError(
+            "指定的背景图片不在作品文件夹的图片列表中：" + str(candidate)
+        )
+    return candidate
+
+
+def smart_background(
+    scan: ScanResult,
+    config: AppConfig,
+    argument: str | None = None,
+) -> Path | None:
+    if argument is not None:
+        return _background_from_argument(scan, argument)
+    if config.background_policy == "black" or not scan.images:
+        if not scan.images:
+            print("\n作品文件夹中没有找到图片，将使用黑色背景。")
+        return None
+    if config.background_policy == "auto":
+        return scan.images[0].resolve()
+
+    print("\n请选择视频背景图片：")
+    for index, image in enumerate(scan.images, start=1):
+        relative = image.relative_to(scan.root).as_posix()
+        marker = "（推荐）" if index == 1 else ""
+        print(f"  {index}. {relative}{marker}")
+    print("  0. 使用黑色背景")
+    while True:
+        answer = input("输入图片编号；直接按 Enter 使用推荐图片 1：").strip()
+        if not answer:
+            return scan.images[0].resolve()
+        try:
+            return _background_from_argument(scan, answer)
+        except VideoPreparerError as exc:
+            print(f"输入无效：{exc}")
 
 
 def safe_filename_component(value: str, *, fallback: str = "未命名", limit: int = 80) -> str:
@@ -2441,6 +2491,17 @@ def render_static_bilingual_video(
             shutil.rmtree(render_dir, ignore_errors=True)
 
 
+def identifier_only_name(value: str) -> bool:
+    """Return whether a folder name is only a catalogue/product identifier."""
+
+    return bool(
+        re.fullmatch(
+            r"(?i)(?:rj|vj|bj|cien|ci-en)?[\s._-]*\d+",
+            value.strip(),
+        )
+    )
+
+
 def translate_titles(
     state: dict[str, Any],
     paths: ToolPaths,
@@ -2479,12 +2540,15 @@ def translate_titles(
     folder_name_original = str(
         state.get("folder_name_original") or Path(state["source_folder"]).name
     ).strip()
+    existing_folder_translation = str(state.get("folder_name_translation") or "").strip()
+    if identifier_only_name(folder_name_original) and not existing_folder_translation:
+        existing_folder_translation = folder_name_original
     folder_sentence = Sentence(
         id="folder0000",
         start_seconds=0.0,
         end_seconds=1.0,
         ja_text=folder_name_original,
-        zh_text=str(state.get("folder_name_translation") or "").strip(),
+        zh_text=existing_folder_translation,
     )
     sentences = [folder_sentence]
     for index, item in enumerate(state["timeline"], start=1):
@@ -2536,12 +2600,9 @@ def translate_titles(
 
     translated: dict[str, str] = {}
     missing: list[str] = []
-    folder_name_translation = folder_sentence.zh_text.strip()
-    if not folder_name_translation:
-        missing.append("文件夹名称")
-    else:
-        state["folder_name_original"] = folder_name_original
-        state["folder_name_translation"] = folder_name_translation
+    folder_name_translation = folder_sentence.zh_text.strip() or folder_name_original
+    state["folder_name_original"] = folder_name_original
+    state["folder_name_translation"] = folder_name_translation
     for item, sentence in zip(state["timeline"], sentences[1:], strict=True):
         title = sentence.zh_text.strip()
         key = str(item.get("relative_path") or item["filename"])
@@ -2569,7 +2630,17 @@ def translated_plan_titles(
         if str(value).strip()
     }
     folder_translation = str(cached.get("folder_name_translation") or "").strip()
+    inferred_folder_translation = False
+    if not folder_translation and identifier_only_name(source_folder.name):
+        folder_translation = source_folder.name
+        inferred_folder_translation = True
     if folder_translation and all(str(translations.get(key) or "").strip() for key in expected_keys):
+        if inferred_folder_translation:
+            updated_cache = dict(cached)
+            updated_cache["folder_name_original"] = source_folder.name
+            updated_cache["folder_name_translation"] = folder_translation
+            updated_cache["title_translations"] = translations
+            save_plan_metadata(plan_id, updated_cache)
         return folder_translation, translations
 
     state: dict[str, Any] = {
@@ -3285,6 +3356,7 @@ def execute_smart_plan(
     edition_argument: str | None,
     include_bonus: bool,
     output_root_argument: str | None,
+    background_argument: str | None,
     rebuild: bool,
     force: bool,
 ) -> None:
@@ -3314,7 +3386,11 @@ def execute_smart_plan(
         raise VideoPreparerError("选中的版本没有可处理的音轨。")
     mode = normalize_mode(mode_argument) if mode_argument else ask_mode(config)
     layout = ask_output_layout(config, layout_argument)
-    background = smart_background(scan, config) if mode != MODE_AUDIO else None
+    background = (
+        smart_background(scan, config, background_argument)
+        if mode != MODE_AUDIO
+        else None
+    )
     plan_id = plan_identity(
         folder,
         mode=mode,
@@ -4003,6 +4079,18 @@ def self_test(paths: ToolPaths) -> None:
         smart_scan = scan_work(root, excluded_directories=("AutoFlow输出",))
         if smart_scan.audio_count != 3 or not smart_scan.editions:
             raise VideoPreparerError("自检失败：智能扫描没有识别传统数字音轨。")
+        if (
+            not identifier_only_name("RJ01563553")
+            or not identifier_only_name("VJ_00123")
+            or identifier_only_name("RJ01563553 作品标题")
+        ):
+            raise VideoPreparerError("自检失败：作品编号文件夹识别错误。")
+        if (
+            _background_from_argument(smart_scan, "auto") != smart_scan.images[0]
+            or _background_from_argument(smart_scan, "1") != smart_scan.images[0]
+            or _background_from_argument(smart_scan, "0") is not None
+        ):
+            raise VideoPreparerError("自检失败：推荐背景、编号选择或黑色背景错误。")
         smart_sources = [
             source_from_candidate(index, item)
             for index, item in enumerate(smart_scan.editions[0].tracks, start=1)
@@ -4283,6 +4371,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--edition", help="smart 扫描时指定版本编号或处理清单中的版本 ID")
     parser.add_argument("--include-bonus", action="store_true", help="smart 扫描时把特典/样本也加入任务")
     parser.add_argument("--output-root", help="smart 扫描的输出目录；默认是源文件夹下的 AutoFlow输出")
+    parser.add_argument(
+        "--background",
+        help=(
+            "视频背景：图片编号、作品目录内的相对/绝对路径、auto，"
+            "或 black；交互运行默认显示全部图片供选择"
+        ),
+    )
     parser.add_argument("--self-test", action="store_true", help="只运行几秒钟的本地媒体自检")
     return parser
 
@@ -4302,8 +4397,17 @@ def main() -> int:
             input("请粘贴解压后的作品文件夹路径：")
         )
         if args.scan == "legacy":
-            if args.layout or args.edition or args.include_bonus or args.output_root:
-                raise VideoPreparerError("legacy 扫描不支持 --layout、--edition、--include-bonus 或 --output-root。")
+            if (
+                args.layout
+                or args.edition
+                or args.include_bonus
+                or args.output_root
+                or args.background
+            ):
+                raise VideoPreparerError(
+                    "legacy 扫描不支持 --layout、--edition、--include-bonus、"
+                    "--output-root 或 --background。"
+                )
             prepare_or_resume(
                 paths,
                 config,
@@ -4322,6 +4426,7 @@ def main() -> int:
                 edition_argument=args.edition,
                 include_bonus=args.include_bonus,
                 output_root_argument=args.output_root,
+                background_argument=args.background,
                 rebuild=args.rebuild,
                 force=args.force,
             )

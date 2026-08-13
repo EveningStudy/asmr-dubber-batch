@@ -30,6 +30,8 @@ EX01 特典.wav
 - 无时间轴的中文台本可以直接作为中文配音稿。
 - PDF 会列入扫描结果，但不会擅自解析。
 
+如果作品文件夹名只有 `RJ01563553`、`VJxxxxxx` 这类作品编号，时间戳文档会原样保留该编号，不会因为编号没有中文译名而中止任务。
+
 ## 程序里的选项
 
 粘贴作品文件夹后，程序会先让你确认音频版本以及是否包含特典，然后依次显示下面两组菜单。
@@ -67,6 +69,8 @@ EX01 特典.wav
 
 所以，“纯音频模式”本身不代表一定拼接。纯音频、普通视频和和谐视频都可以搭配这三种成品组织方式。
 
+选择视频模式和成品组织方式后，程序会把作品文件夹里的所有图片按相对路径列出来。内部评分最高的图片排在第一位并标记为“推荐”：直接按 Enter 就使用这张图，也可以输入其他编号换图，输入 `0` 使用黑色背景。原图片不会被修改。
+
 分轨任务会先处理最长的一条音轨。你只需要选择一次统一音色参考，程序会把它固化为本作品的共用参考，后面的音轨自动复用。五分钟内没有手动选择时，继续使用 ASMR Dubber 推荐的默认参考片段。
 
 和谐模式下，每个独立分轨视频都有自己的前置无声画面；合并版只在整部作品开头增加一次。
@@ -77,7 +81,7 @@ EX01 特典.wav
 2. 打开 `settings.txt`，把 `asmr_dubber_path` 改成 ASMR Dubber 所在目录。
 3. 双击 `ASMR-Dubber-AutoFlow.cmd`。
 4. 粘贴解压后的作品文件夹路径。
-5. 按提示依次确认音频版本、特典、处理类型、视频分支（如果选择视频）和成品组织方式。
+5. 按提示依次确认音频版本、特典、处理类型、视频分支（如果选择视频）和成品组织方式；视频模式还要确认背景图片。
 6. 网页打开后，点击“打开项目”，选择一段清晰音频并点击“设为项目音色参考”。如果还改了校对表格，也要保存表格。
 7. 回到命令行等待完成。
 
@@ -124,14 +128,14 @@ output_folder_name=AutoFlow输出
 default_output_layout=ask
 preferred_audio_formats=wav,flac,ape,m4a,mp3
 bonus_policy=ask
-background_policy=auto
+background_policy=ask
 harmonized_volume_reduction_db=10
 harmonized_delay_minutes=20
 ```
 
 - `default_output_layout`：`ask`、`merged`、`separate` 或 `both`。
 - `bonus_policy`：`ask`、`include` 或 `exclude`。
-- `background_policy`：`auto` 自动选择 `null`、封面或体积较大的图片；`black` 始终使用黑色。
+- `background_policy`：`ask` 列出全部图片，直接回车使用内部评分最高的推荐图；`auto` 不询问并直接使用推荐图；`black` 始终使用黑色。
 - `timestamp_footer_line_1` 至 `timestamp_footer_line_5`：写入时间戳文档末尾，留空即可删除。
 
 修改设置只影响新任务。已经开始的任务会继续使用创建时保存的音量、延后时间和参考音频；需要全部重做时使用 `--rebuild`。
@@ -153,6 +157,10 @@ ASMR-Dubber-AutoFlow.cmd "D:\作品文件夹" --mode video-harmonized --layout m
 
 # 指定扫描列表里的版本并包含特典
 ASMR-Dubber-AutoFlow.cmd "D:\作品文件夹" --edition 2 --include-bonus
+
+# 非交互指定背景：可以填写图片编号、作品目录中的相对路径、auto 或 black
+ASMR-Dubber-AutoFlow.cmd "D:\作品文件夹" --mode video-normal --background 3
+ASMR-Dubber-AutoFlow.cmd "D:\作品文件夹" --mode video-normal --background "おまけ\イラスト\1.jpg"
 
 # 丢弃这一计划的 AutoFlow 成品和状态后重做
 ASMR-Dubber-AutoFlow.cmd "D:\作品文件夹" --rebuild

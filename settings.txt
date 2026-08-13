@@ -15,8 +15,8 @@ preferred_audio_formats=wav,flac,ape,m4a,mp3
 # 特典、样本、Free Talk、闹钟等附加音轨：ask、include 或 exclude。
 bonus_policy=ask
 
-# 视频背景：auto（自动选封面/null 图片）或 black（始终黑色）。
-background_policy=auto
+# 视频背景：ask（列出全部图片，回车使用推荐图）、auto（直接使用推荐图）或 black（始终黑色）。
+background_policy=ask
 
 # 和谐视频最终成品降低的分贝数。填写正数。
 harmonized_volume_reduction_db=10
