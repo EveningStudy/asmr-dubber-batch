@@ -18,6 +18,7 @@ from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
+from unittest.mock import patch
 
 from autoflow.catalog import (
     Edition,
@@ -33,6 +34,7 @@ WORK_ROOT = TOOL_ROOT / ".work"
 STATE_ROOT = TOOL_ROOT / ".state"
 SETTINGS_FILE = TOOL_ROOT / "settings.txt"
 LOG_FILE = STATE_ROOT / "autoflow.log"
+LAST_OPTIONS_FILE = STATE_ROOT / "last-options.json"
 LOG_MAX_BYTES = 8 * 1024 * 1024
 
 DEFAULT_HARMONIZED_VOLUME_REDUCTION_DB = 10.0
@@ -44,6 +46,7 @@ VIDEO_FPS = 5
 KEYFRAME_INTERVAL_SECONDS = 10
 REFERENCE_SELECTION_TIMEOUT_SECONDS = 5 * 60
 TIMESTAMP_SCHEMA = 2
+LAST_OPTIONS_SCHEMA = 1
 PERIODIC_KEYFRAME_OPTIONS = (
     "-g",
     str(VIDEO_FPS * KEYFRAME_INTERVAL_SECONDS),
@@ -179,6 +182,41 @@ class SmartTaskPlan:
     force: bool
 
 
+@dataclass(frozen=True)
+class SmartPlanDefaults:
+    """Reusable choices inherited by the next work and the next app launch."""
+
+    mode: str
+    video_mode: str
+    layout: str
+    include_bonus: bool
+    background_choice: str
+    background_relative: str | None
+    embed_subtitles: bool
+    edition_extension: str | None = None
+    edition_language: str | None = None
+    edition_mix_variant: str | None = None
+    edition_orientation: str | None = None
+
+
+@dataclass
+class SmartPlanDraft:
+    folder: Path
+    output_root: Path
+    scan: ScanResult
+    edition_label: str
+    sources: list[AudioSource]
+    edition: dict[str, Any]
+    include_bonus: bool
+    mode: str
+    video_mode: str
+    layout: str
+    background: Path | None
+    background_choice: str
+    background_relative: str | None
+    embed_subtitles: bool
+
+
 def print_header() -> None:
     print()
     print("=" * 68)
@@ -258,6 +296,100 @@ def layout_label(layout: str) -> str:
         LAYOUT_SEPARATE: "每条音轨分别输出",
         LAYOUT_BOTH: "分轨输出 + 合并版",
     }[normalize_layout(layout)]
+
+
+def initial_smart_plan_defaults(config: AppConfig) -> SmartPlanDefaults:
+    layout = (
+        LAYOUT_MERGED
+        if config.default_output_layout == "ask"
+        else normalize_layout(config.default_output_layout)
+    )
+    return SmartPlanDefaults(
+        mode=MODE_VIDEO_NORMAL,
+        video_mode=MODE_VIDEO_NORMAL,
+        layout=layout,
+        include_bonus=config.bonus_policy == "include",
+        background_choice=(
+            "black" if config.background_policy == "black" else "auto"
+        ),
+        background_relative=None,
+        embed_subtitles=True,
+    )
+
+
+def load_smart_plan_defaults(
+    config: AppConfig,
+    path: Path | None = None,
+) -> SmartPlanDefaults:
+    path = LAST_OPTIONS_FILE if path is None else path
+    fallback = initial_smart_plan_defaults(config)
+    if not path.is_file():
+        return fallback
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema") != LAST_OPTIONS_SCHEMA:
+            return fallback
+        mode = normalize_mode(payload.get("mode"))
+        video_mode = normalize_mode(payload.get("video_mode"))
+        if video_mode not in {MODE_VIDEO_NORMAL, MODE_VIDEO_HARMONIZED}:
+            video_mode = MODE_VIDEO_NORMAL
+        layout = normalize_layout(payload.get("layout"))
+        background_choice = str(payload.get("background_choice") or "auto")
+        if background_choice not in {"auto", "black", "relative"}:
+            background_choice = "auto"
+        background_relative = str(payload.get("background_relative") or "").strip()
+        if background_choice != "relative" or not background_relative:
+            background_relative = None
+        return SmartPlanDefaults(
+            mode=mode,
+            video_mode=video_mode,
+            layout=layout,
+            include_bonus=bool(payload.get("include_bonus", False)),
+            background_choice=background_choice,
+            background_relative=background_relative,
+            embed_subtitles=bool(payload.get("embed_subtitles", True)),
+            edition_extension=str(payload.get("edition_extension") or "").strip()
+            or None,
+            edition_language=str(payload.get("edition_language") or "").strip()
+            or None,
+            edition_mix_variant=str(
+                payload.get("edition_mix_variant") or ""
+            ).strip()
+            or None,
+            edition_orientation=str(
+                payload.get("edition_orientation") or ""
+            ).strip()
+            or None,
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, VideoPreparerError):
+        return fallback
+
+
+def save_smart_plan_defaults(
+    defaults: SmartPlanDefaults,
+    path: Path | None = None,
+) -> None:
+    path = LAST_OPTIONS_FILE if path is None else path
+    payload = {
+        "schema": LAST_OPTIONS_SCHEMA,
+        "mode": normalize_mode(defaults.mode),
+        "video_mode": normalize_mode(defaults.video_mode),
+        "layout": normalize_layout(defaults.layout),
+        "include_bonus": bool(defaults.include_bonus),
+        "background_choice": defaults.background_choice,
+        "background_relative": defaults.background_relative,
+        "embed_subtitles": bool(defaults.embed_subtitles),
+        "edition_extension": defaults.edition_extension,
+        "edition_language": defaults.edition_language,
+        "edition_mix_variant": defaults.edition_mix_variant,
+        "edition_orientation": defaults.edition_orientation,
+        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    atomic_write_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def load_app_config(path: Path = SETTINGS_FILE) -> AppConfig:
@@ -779,6 +911,145 @@ def choose_tracks(
     )
 
 
+def _sorted_editions(scan: ScanResult, config: AppConfig) -> list[Edition]:
+    return sorted(
+        scan.editions,
+        key=lambda item: _edition_rank(item, config),
+        reverse=True,
+    )
+
+
+def default_edition_for_work(
+    scan: ScanResult,
+    config: AppConfig,
+    defaults: SmartPlanDefaults,
+) -> Edition:
+    editions = _sorted_editions(scan, config)
+    if not editions:
+        raise VideoPreparerError("没有找到可处理的音频文件。")
+    if not defaults.edition_extension:
+        return editions[0]
+    same_format = [
+        item
+        for item in editions
+        if item.extension.casefold() == defaults.edition_extension.casefold()
+    ]
+    if not same_format:
+        return editions[0]
+
+    def preference_rank(item: Edition) -> tuple[int, int, int, Any]:
+        matches = sum(
+            (
+                defaults.edition_language is not None
+                and item.language == defaults.edition_language,
+                defaults.edition_mix_variant is not None
+                and item.mix_variant == defaults.edition_mix_variant,
+                defaults.edition_orientation is not None
+                and item.orientation == defaults.edition_orientation,
+            )
+        )
+        score, format_rank, natural = _edition_rank(item, config)
+        return matches, score, format_rank, natural
+
+    return max(same_format, key=preference_rank)
+
+
+def tracks_for_edition(
+    scan: ScanResult,
+    config: AppConfig,
+    edition: Edition,
+    *,
+    include_bonus: bool,
+) -> tuple[str, list[AudioSource], dict[str, Any]]:
+    return choose_tracks(
+        scan,
+        replace(config, bonus_policy="exclude"),
+        edition_argument=edition.id,
+        include_bonus=include_bonus,
+    )
+
+
+def ask_tracks_for_draft(
+    scan: ScanResult,
+    config: AppConfig,
+    *,
+    include_bonus: bool,
+) -> tuple[str, list[AudioSource], dict[str, Any]]:
+    editions = _sorted_editions(scan, config)
+    if not editions:
+        raise VideoPreparerError("没有找到可处理的音频文件。")
+    print("\n请选择要处理的音频版本：")
+    for index, edition in enumerate(editions, start=1):
+        marker = "（推荐）" if index == 1 else ""
+        optional_text = (
+            f"，另有 {len(edition.optional_tracks)} 个特典/样本"
+            if edition.optional_tracks
+            else ""
+        )
+        print(
+            f"  {index}. {edition.label}：{len(edition.tracks)} 轨"
+            f"{optional_text}{marker}"
+        )
+    print("  M. 手动逐条选择")
+    while True:
+        answer = input("输入编号；直接按 Enter 使用推荐版本：").strip().casefold()
+        if not answer:
+            return tracks_for_edition(
+                scan,
+                config,
+                editions[0],
+                include_bonus=include_bonus,
+            )
+        if answer.isdigit() and 1 <= int(answer) <= len(editions):
+            return tracks_for_edition(
+                scan,
+                config,
+                editions[int(answer) - 1],
+                include_bonus=include_bonus,
+            )
+        if answer != "m":
+            print("输入无效，请输入版本编号或 M。")
+            continue
+
+        all_tracks = _all_scan_tracks(scan)
+        print("\n全部音频：")
+        for index, track in enumerate(all_tracks, start=1):
+            category = (
+                "" if track.category == "main" else f" [{category_label(track.category)}]"
+            )
+            print(f"  {index:>3}. {track.relative_path}{category}")
+        while True:
+            try:
+                indexes = _parse_track_selection(
+                    input("输入要处理的编号，例如 1,3-6：").strip(),
+                    len(all_tracks),
+                )
+            except VideoPreparerError as exc:
+                print(f"输入无效：{exc}")
+                continue
+            if not indexes:
+                print("没有选择任何音轨，请重新输入。")
+                continue
+            break
+        selected_candidates = [all_tracks[index - 1] for index in indexes]
+        sources = [
+            source_from_candidate(index, item)
+            for index, item in enumerate(selected_candidates, start=1)
+        ]
+        return (
+            "自定义音轨",
+            sources,
+            {
+                "edition_id": "custom",
+                "edition_label": "自定义音轨",
+                "manual": True,
+                "included_optional": any(
+                    item.is_optional for item in selected_candidates
+                ),
+            },
+        )
+
+
 def _background_from_argument(scan: ScanResult, value: str) -> Path | None:
     answer = value.strip().strip('"').strip("'")
     normalized = answer.casefold()
@@ -832,6 +1103,57 @@ def smart_background(
             return _background_from_argument(scan, answer)
         except VideoPreparerError as exc:
             print(f"输入无效：{exc}")
+
+
+def resolve_inherited_background(
+    scan: ScanResult,
+    defaults: SmartPlanDefaults,
+) -> tuple[Path | None, str, str | None]:
+    if defaults.background_choice == "black":
+        return None, "black", None
+    if defaults.background_choice == "relative" and defaults.background_relative:
+        candidate = (scan.root / defaults.background_relative).resolve()
+        available = {path.resolve() for path in scan.images}
+        if candidate in available:
+            return candidate, "relative", defaults.background_relative
+    return (
+        scan.images[0].resolve() if scan.images else None,
+        "auto",
+        None,
+    )
+
+
+def background_selection_details(
+    scan: ScanResult,
+    selected: Path | None,
+) -> tuple[Path | None, str, str | None]:
+    if not scan.images:
+        return None, "auto", None
+    if selected is None:
+        return None, "black", None
+    resolved = selected.resolve()
+    if resolved == scan.images[0].resolve():
+        return resolved, "auto", None
+    return resolved, "relative", resolved.relative_to(scan.root.resolve()).as_posix()
+
+
+def background_draft_label(draft: SmartPlanDraft) -> str:
+    if draft.mode == MODE_AUDIO:
+        if draft.background_choice == "black":
+            return "黑色背景（当前纯音频，不适用）"
+        if draft.background is not None:
+            relative = draft.background.relative_to(draft.scan.root.resolve()).as_posix()
+            marker = "（推荐）" if draft.background_choice == "auto" else ""
+            return f"{relative}{marker}（当前纯音频，不适用）"
+        return "自动推荐图（当前纯音频，不适用；本作品未找到图片）"
+    if draft.background is None:
+        if draft.background_choice == "black":
+            return "黑色背景"
+        return "自动推荐图（本作品未找到图片，实际使用黑色）"
+    relative = draft.background.relative_to(draft.scan.root.resolve()).as_posix()
+    if draft.background_choice == "auto":
+        return f"{relative}（推荐）"
+    return relative
 
 
 def safe_filename_component(value: str, *, fallback: str = "未命名", limit: int = 80) -> str:
@@ -3503,6 +3825,272 @@ def output_mapping_complete(outputs: Any, *, mode: str) -> bool:
     return all(Path(str(outputs.get(key) or "")).is_file() for key in required)
 
 
+def prepare_smart_plan_draft(
+    config: AppConfig,
+    folder: Path,
+    defaults: SmartPlanDefaults,
+    args: argparse.Namespace,
+) -> SmartPlanDraft:
+    if not folder.is_dir():
+        raise VideoPreparerError(f"文件夹不存在：{folder}")
+    output_root = (folder / config.output_folder_name).resolve()
+    scan = scan_work(
+        folder,
+        excluded_directories=(config.output_folder_name, output_root.name),
+    )
+    edition = default_edition_for_work(scan, config, defaults)
+    include_bonus = bool(args.include_bonus or defaults.include_bonus)
+    edition_label, sources, edition_metadata = tracks_for_edition(
+        scan,
+        config,
+        edition,
+        include_bonus=include_bonus,
+    )
+    mode = normalize_mode(args.mode) if args.mode else normalize_mode(defaults.mode)
+    video_mode = (
+        mode
+        if mode in {MODE_VIDEO_NORMAL, MODE_VIDEO_HARMONIZED}
+        else normalize_mode(defaults.video_mode)
+    )
+    layout = (
+        normalize_layout(args.layout)
+        if args.layout
+        else normalize_layout(defaults.layout)
+    )
+    background, background_choice, background_relative = resolve_inherited_background(
+        scan,
+        defaults,
+    )
+    embed_subtitles = (
+        parse_embed_subtitles_argument(args.embed_subtitles)
+        if args.embed_subtitles is not None
+        else defaults.embed_subtitles
+    )
+    return SmartPlanDraft(
+        folder=folder.resolve(),
+        output_root=output_root,
+        scan=scan,
+        edition_label=edition_label,
+        sources=sources,
+        edition=edition_metadata,
+        include_bonus=include_bonus,
+        mode=mode,
+        video_mode=video_mode,
+        layout=layout,
+        background=background,
+        background_choice=background_choice,
+        background_relative=background_relative,
+        embed_subtitles=embed_subtitles,
+    )
+
+
+def media_type_label(mode: str) -> str:
+    return "纯音频" if normalize_mode(mode) == MODE_AUDIO else "静态视频"
+
+
+def video_branch_label(mode: str, config: AppConfig) -> str:
+    normalized = normalize_mode(mode)
+    if normalized == MODE_VIDEO_HARMONIZED:
+        return (
+            f"和谐（{config.harmonized_volume_db:g} dB，"
+            f"延后 {config.harmonized_delay_seconds / 60:g} 分钟）"
+        )
+    return "普通（原音量，无前置空档）"
+
+
+def print_smart_plan_defaults_panel(
+    draft: SmartPlanDraft,
+    config: AppConfig,
+    *,
+    index: int,
+) -> None:
+    optional_count = sum(item.category != "main" for item in draft.sources)
+    if bool(draft.edition.get("manual")):
+        bonus_label = "由自定义音轨决定"
+    else:
+        bonus_label = "包含" if draft.include_bonus else "不包含"
+        if optional_count:
+            bonus_label += f"（当前 {optional_count} 轨）"
+    video_suffix = "（当前不适用）" if draft.mode == MODE_AUDIO else ""
+    print("\n" + "-" * 68)
+    print(f"作品 {index}：{draft.folder.name}")
+    print("当前默认选项（继承上一个作品，可输入编号修改）：")
+    print(f"  1. 音频版本：{draft.edition_label}（共 {len(draft.sources)} 轨）")
+    print(f"  2. 附加音轨：{bonus_label}")
+    print(f"  3. 输出类型：{media_type_label(draft.mode)}")
+    print(f"  4. 视频分支：{video_branch_label(draft.video_mode, config)}{video_suffix}")
+    print(f"  5. 成品组织：{layout_label(draft.layout)}")
+    print(f"  6. 视频画面：{background_draft_label(draft)}")
+    subtitle_label = "内嵌，同时保留 SRT/LRC" if draft.embed_subtitles else "不内嵌，仅保留 SRT/LRC"
+    print(f"  7. 视频字幕：{subtitle_label}{video_suffix}")
+    print(f"  输出目录：{draft.output_root}")
+    print("\n直接按 Enter：确认本作品，然后输入下一个作品路径")
+    print("输入 0：确认本作品，并立即开始处理全部任务")
+
+
+def ask_media_type_for_draft(draft: SmartPlanDraft) -> None:
+    print("\n请选择输出类型：")
+    print("  1. 纯音频")
+    print("  2. 静态视频")
+    while True:
+        answer = input("输入 1 或 2：").strip()
+        if answer == "1":
+            draft.mode = MODE_AUDIO
+            return
+        if answer == "2":
+            draft.mode = draft.video_mode
+            return
+        print("输入无效，请重新选择。")
+
+
+def ask_video_branch_for_draft(draft: SmartPlanDraft, config: AppConfig) -> None:
+    print("\n请选择视频分支：")
+    print("  1. 普通（原音量，无前置空档）")
+    print(
+        f"  2. 和谐（{config.harmonized_volume_db:g} dB，"
+        f"延后 {config.harmonized_delay_seconds / 60:g} 分钟）"
+    )
+    while True:
+        answer = input("输入 1 或 2：").strip()
+        if answer == "1":
+            draft.video_mode = MODE_VIDEO_NORMAL
+            break
+        if answer == "2":
+            draft.video_mode = MODE_VIDEO_HARMONIZED
+            break
+        print("输入无效，请重新选择。")
+    if draft.mode != MODE_AUDIO:
+        draft.mode = draft.video_mode
+
+
+def update_draft_edition(draft: SmartPlanDraft, config: AppConfig) -> None:
+    label, sources, edition = ask_tracks_for_draft(
+        draft.scan,
+        config,
+        include_bonus=draft.include_bonus,
+    )
+    draft.edition_label = label
+    draft.sources = sources
+    draft.edition = edition
+    if bool(edition.get("manual")):
+        draft.include_bonus = bool(edition.get("included_optional"))
+
+
+def update_draft_bonus(draft: SmartPlanDraft, config: AppConfig) -> None:
+    if bool(draft.edition.get("manual")):
+        print("自定义音轨中的特典由第 1 项决定；请重新选择音频版本或音轨。")
+        return
+    include_bonus = ask_yes_no("输入 Y 包含附加音轨，输入 N 不包含：")
+    edition_id = str(draft.edition.get("edition_id") or "")
+    label, sources, edition = choose_tracks(
+        draft.scan,
+        replace(config, bonus_policy="exclude"),
+        edition_argument=edition_id,
+        include_bonus=include_bonus,
+    )
+    draft.edition_label = label
+    draft.sources = sources
+    draft.edition = edition
+    draft.include_bonus = include_bonus
+
+
+def configure_smart_plan_draft(
+    draft: SmartPlanDraft,
+    config: AppConfig,
+    *,
+    index: int,
+    rebuild: bool,
+    force: bool,
+) -> tuple[SmartTaskPlan, SmartPlanDefaults, bool]:
+    """Return the plan, inherited defaults, and whether execution should start."""
+
+    while True:
+        print_smart_plan_defaults_panel(draft, config, index=index)
+        answer = input("输入 1-7 修改；直接按 Enter 添加下一个；输入 0 开始：").strip()
+        if answer in {"", "0"}:
+            break
+        if answer == "1":
+            update_draft_edition(draft, config)
+        elif answer == "2":
+            update_draft_bonus(draft, config)
+        elif answer == "3":
+            ask_media_type_for_draft(draft)
+        elif answer == "4":
+            ask_video_branch_for_draft(draft, config)
+        elif answer == "5":
+            draft.layout = ask_output_layout(
+                replace(config, default_output_layout="ask")
+            )
+        elif answer == "6":
+            selected = smart_background(
+                draft.scan,
+                replace(config, background_policy="ask"),
+            )
+            (
+                draft.background,
+                draft.background_choice,
+                draft.background_relative,
+            ) = background_selection_details(draft.scan, selected)
+        elif answer == "7":
+            print("\n无论如何都会另外保留双语版.srt 和双语版.lrc。")
+            draft.embed_subtitles = ask_yes_no(
+                "输入 Y 内嵌字幕，输入 N 仅保留外部字幕："
+            )
+        else:
+            print("输入无效，请输入 1-7、0，或直接按 Enter。")
+
+    mode = normalize_mode(draft.mode)
+    plan_background = draft.background if mode != MODE_AUDIO else None
+    plan_embed_subtitles = draft.embed_subtitles if mode != MODE_AUDIO else False
+    plan_id = plan_identity(
+        draft.folder,
+        mode=mode,
+        layout=draft.layout,
+        edition=draft.edition,
+        sources=draft.sources,
+        output_root=draft.output_root,
+        background=plan_background,
+        embed_subtitles=plan_embed_subtitles,
+    )
+    plan = SmartTaskPlan(
+        folder=draft.folder,
+        output_root=draft.output_root,
+        edition_label=draft.edition_label,
+        sources=tuple(draft.sources),
+        edition=draft.edition,
+        mode=mode,
+        layout=draft.layout,
+        background=plan_background,
+        embed_subtitles=plan_embed_subtitles,
+        plan_id=plan_id,
+        rebuild=rebuild,
+        force=force,
+    )
+    edition_extension = None
+    if not bool(draft.edition.get("manual")):
+        edition_extension = str(draft.edition.get("extension") or "").strip() or None
+    defaults = SmartPlanDefaults(
+        mode=mode,
+        video_mode=draft.video_mode,
+        layout=draft.layout,
+        include_bonus=draft.include_bonus,
+        background_choice=draft.background_choice,
+        background_relative=draft.background_relative,
+        embed_subtitles=draft.embed_subtitles,
+        edition_extension=edition_extension,
+        edition_language=str(draft.edition.get("language") or "").strip() or None,
+        edition_mix_variant=str(
+            draft.edition.get("mix_variant") or ""
+        ).strip()
+        or None,
+        edition_orientation=str(
+            draft.edition.get("orientation") or ""
+        ).strip()
+        or None,
+    )
+    return plan, defaults, answer == "0"
+
+
 def prepare_smart_plan(
     config: AppConfig,
     folder: Path,
@@ -4492,6 +5080,23 @@ def self_test(paths: ToolPaths) -> None:
             or parsed_config.timestamp_footer != "测试页脚"
         ):
             raise VideoPreparerError("自检失败：settings.txt 解析错误。")
+        remembered_defaults = SmartPlanDefaults(
+            mode=MODE_AUDIO,
+            video_mode=MODE_VIDEO_HARMONIZED,
+            layout=LAYOUT_BOTH,
+            include_bonus=True,
+            background_choice="relative",
+            background_relative="cover.jpg",
+            embed_subtitles=False,
+            edition_extension=".wav",
+            edition_language="ja",
+            edition_mix_variant="standard",
+            edition_orientation="standard",
+        )
+        remembered_path = root / "last-options.json"
+        save_smart_plan_defaults(remembered_defaults, remembered_path)
+        if load_smart_plan_defaults(parsed_config, remembered_path) != remembered_defaults:
+            raise VideoPreparerError("自检失败：最后一次选项没有正确保存或恢复。")
 
         catalogue_root = root / "catalogue"
         wav_dir = catalogue_root / "WAV"
@@ -4526,6 +5131,58 @@ def self_test(paths: ToolPaths) -> None:
         )
         if len(selected_with_bonus) != 2 or selected_with_bonus[-1].category != "bonus":
             raise VideoPreparerError("自检失败：独立特典目录没有加入所选版本。")
+        inherited_edition = default_edition_for_work(
+            catalogue,
+            parsed_config,
+            remembered_defaults,
+        )
+        if inherited_edition.extension != ".wav":
+            raise VideoPreparerError("自检失败：下一个作品没有沿用上次的音频格式。")
+        queue_args = argparse.Namespace(
+            mode=None,
+            layout=None,
+            edition=None,
+            include_bonus=False,
+            output_root=None,
+            background=None,
+            embed_subtitles=None,
+            rebuild=False,
+            force=False,
+        )
+        inherited_draft = prepare_smart_plan_draft(
+            parsed_config,
+            catalogue_root,
+            remembered_defaults,
+            queue_args,
+        )
+        if (
+            inherited_draft.mode != MODE_AUDIO
+            or inherited_draft.video_mode != MODE_VIDEO_HARMONIZED
+            or inherited_draft.layout != LAYOUT_BOTH
+            or not inherited_draft.include_bonus
+            or inherited_draft.embed_subtitles
+        ):
+            raise VideoPreparerError("自检失败：作品选项没有从上一个项目继承。")
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as sink:
+            with redirect_stdout(sink), redirect_stderr(sink), patch(
+                "builtins.input",
+                side_effect=("3", "2", "4", "1", "5", "1", "0"),
+            ):
+                inherited_plan, next_defaults, start_now = configure_smart_plan_draft(
+                    inherited_draft,
+                    parsed_config,
+                    index=1,
+                    rebuild=False,
+                    force=False,
+                )
+        if (
+            not start_now
+            or inherited_plan.mode != MODE_VIDEO_NORMAL
+            or inherited_plan.layout != LAYOUT_MERGED
+            or next_defaults.mode != MODE_VIDEO_NORMAL
+            or next_defaults.video_mode != MODE_VIDEO_NORMAL
+        ):
+            raise VideoPreparerError("自检失败：默认选项面板没有正确修改或开始任务。")
 
         audio_output_folder = root / "audio-mode"
         audio_output_folder.mkdir()
@@ -4770,23 +5427,38 @@ def collect_interactive_smart_plans(
 
     plans: list[SmartTaskPlan] = []
     configured_folders: set[Path] = set()
+    defaults = load_smart_plan_defaults(config)
+    if LAST_OPTIONS_FILE.is_file():
+        print("已载入上次使用的默认选项；每个作品都可以单独修改。")
     while True:
         number = len(plans) + 1
-        folder = clean_user_path(input(f"请粘贴第 {number} 个作品文件夹路径："))
+        prompt = f"请粘贴第 {number} 个作品文件夹路径"
+        if plans:
+            prompt += "；直接按 Enter 开始处理已有队列"
+        raw_path = input(prompt + "：").strip()
+        if not raw_path:
+            if plans:
+                break
+            print("还没有添加作品，请先输入一个文件夹路径。")
+            continue
+        try:
+            folder = clean_user_path(raw_path)
+        except VideoPreparerError as exc:
+            print(f"路径无效：{exc}")
+            continue
         resolved = folder.resolve()
         if resolved in configured_folders:
             print("这个作品已经在任务列表中，请换一个文件夹。")
             continue
-        plan = prepare_smart_plan(
+        try:
+            draft = prepare_smart_plan_draft(config, folder, defaults, args)
+        except VideoPreparerError as exc:
+            print(f"无法配置这个作品：{exc}")
+            continue
+        plan, defaults, start_now = configure_smart_plan_draft(
+            draft,
             config,
-            folder,
-            mode_argument=args.mode,
-            layout_argument=args.layout,
-            edition_argument=args.edition,
-            include_bonus=args.include_bonus,
-            output_root_argument=args.output_root,
-            background_argument=args.background,
-            embed_subtitles_argument=args.embed_subtitles,
+            index=number,
             rebuild=args.rebuild,
             force=args.force,
         )
@@ -4796,8 +5468,9 @@ def collect_interactive_smart_plans(
             )
         plans.append(plan)
         configured_folders.add(resolved)
-        print_smart_plan_summary(plan, index=number)
-        if not ask_yes_no("\n是否添加下一个 DLsite 作品？输入 Y 添加，输入 N 开始处理："):
+        save_smart_plan_defaults(defaults)
+        print(f"\n已加入队列：{plan.folder.name}")
+        if start_now:
             break
     return plans
 
