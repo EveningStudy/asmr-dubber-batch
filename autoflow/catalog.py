@@ -57,6 +57,7 @@ _VOICE_ONLY_RE = re.compile(r"(?:音声|声|voice)[ _\-]*のみ", re.IGNORECASE)
 _REVERSED_RE = re.compile(r"(?:左右反転|反転版|左右逆|reverse|reversed)", re.IGNORECASE)
 _ZH_RE = re.compile(r"(?:简体|簡體|繁体|繁體|中文|中国語|zh[-_ ]?(?:cn|hans|hant)?|chinese)", re.IGNORECASE)
 _EN_RE = re.compile(r"(?:英語|英文|english)", re.IGNORECASE)
+_JA_RE = re.compile(r"(?:日文|日本語|japanese)", re.IGNORECASE)
 _GENERIC_DIRECTORY_RE = re.compile(
     r"^(?:\d+[. _-]*)?(?:本編|本篇|main|audio|音声|音聲|wav|flac|mp3|m4a|aac|ogg|opus)$",
     re.IGNORECASE,
@@ -159,7 +160,24 @@ def _orientation(path_text: str) -> str:
 
 
 def _transcript_language(path: Path) -> str:
-    return _language(path.as_posix())
+    path_text = path.as_posix()
+    if _ZH_RE.search(path_text):
+        return "zh"
+    if _EN_RE.search(path_text) or re.search(
+        r"(?:^|/)en(?:[-_]?(?:us|gb))?(?:/|$)",
+        normalized_text(path_text),
+    ):
+        return "en"
+    if _JA_RE.search(path_text) or re.search(
+        r"(?:^|/)ja(?:[-_]?jp)?(?:/|$)",
+        normalized_text(path_text),
+    ):
+        return "ja"
+    # DLsite 同捆的 LRC 多数是中文翻译字幕；没有明确语言标记时按中文，
+    # 仍可在 AutoFlow 的作品配置面板中逐文件改成日文、英文或忽略。
+    if path.suffix.casefold() == ".lrc":
+        return "zh"
+    return "ja"
 
 
 def _transcript_stem(path: Path) -> str:

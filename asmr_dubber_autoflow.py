@@ -35,6 +35,7 @@ STATE_ROOT = TOOL_ROOT / ".state"
 SETTINGS_FILE = TOOL_ROOT / "settings.txt"
 LOG_FILE = STATE_ROOT / "autoflow.log"
 LAST_OPTIONS_FILE = STATE_ROOT / "last-options.json"
+FAILED_TASKS_FILE = STATE_ROOT / "failed-tasks.json"
 LOG_MAX_BYTES = 8 * 1024 * 1024
 
 DEFAULT_HARMONIZED_VOLUME_REDUCTION_DB = 10.0
@@ -47,6 +48,7 @@ KEYFRAME_INTERVAL_SECONDS = 10
 REFERENCE_SELECTION_TIMEOUT_SECONDS = 5 * 60
 TIMESTAMP_SCHEMA = 2
 LAST_OPTIONS_SCHEMA = 1
+FAILED_TASKS_SCHEMA = 1
 PERIODIC_KEYFRAME_OPTIONS = (
     "-g",
     str(VIDEO_FPS * KEYFRAME_INTERVAL_SECONDS),
@@ -180,6 +182,7 @@ class SmartTaskPlan:
     plan_id: str
     rebuild: bool
     force: bool
+    retry_of: str | None = None
 
 
 @dataclass(frozen=True)
@@ -215,6 +218,14 @@ class SmartPlanDraft:
     background_choice: str
     background_relative: str | None
     embed_subtitles: bool
+    transcript_choices: dict[str, str]
+
+
+@dataclass
+class QueuedSmartWork:
+    draft: SmartPlanDraft
+    plan: SmartTaskPlan
+    defaults: SmartPlanDefaults
 
 
 def print_header() -> None:
@@ -3825,6 +3836,132 @@ def output_mapping_complete(outputs: Any, *, mode: str) -> bool:
     return all(Path(str(outputs.get(key) or "")).is_file() for key in required)
 
 
+TRANSCRIPT_LANGUAGE_LABELS = {
+    "zh": "中文台本/字幕",
+    "ja": "日文台本/字幕",
+    "en": "英文台本/字幕",
+    "ignore": "不使用这份台本",
+    "auto": "按文件名自动判断",
+}
+
+
+def transcript_key(path: Path) -> str:
+    return os.path.normcase(str(path.resolve()))
+
+
+def default_transcript_language(path: Path) -> str:
+    if path.suffix.casefold() == ".pdf":
+        return "ignore"
+    return "zh"
+
+
+def default_transcript_choices(scan: ScanResult) -> dict[str, str]:
+    return {
+        transcript_key(item.path): default_transcript_language(item.path)
+        for item in scan.transcripts
+    }
+
+
+def effective_sources_for_draft(draft: SmartPlanDraft) -> list[AudioSource]:
+    effective: list[AudioSource] = []
+    for source in draft.sources:
+        if source.transcript_path is None:
+            effective.append(source)
+            continue
+        choice = draft.transcript_choices.get(
+            transcript_key(source.transcript_path),
+            default_transcript_language(source.transcript_path),
+        )
+        if choice == "ignore":
+            effective.append(
+                replace(
+                    source,
+                    transcript_path=None,
+                    transcript_language=None,
+                    transcript_timed=False,
+                )
+            )
+        elif choice == "auto":
+            effective.append(source)
+        elif choice in {"zh", "ja", "en"}:
+            effective.append(replace(source, transcript_language=choice))
+        else:
+            raise VideoPreparerError(f"未知台本语言选择：{choice}")
+    return effective
+
+
+def transcript_rows_for_draft(
+    draft: SmartPlanDraft,
+) -> list[tuple[Any, list[str]]]:
+    matched: dict[str, list[str]] = {}
+    for source in draft.sources:
+        if source.transcript_path is None:
+            continue
+        matched.setdefault(transcript_key(source.transcript_path), []).append(
+            source.relative_path or source.path.name
+        )
+    rows: list[tuple[Any, list[str]]] = []
+    for transcript in draft.scan.transcripts:
+        rows.append((transcript, matched.get(transcript_key(transcript.path), [])))
+    return rows
+
+
+def transcript_choice_label(
+    draft: SmartPlanDraft,
+    transcript: Any,
+) -> str:
+    choice = draft.transcript_choices.get(
+        transcript_key(transcript.path),
+        default_transcript_language(transcript.path),
+    )
+    if choice == "auto":
+        detected = str(transcript.language or "ja").casefold()
+        return f"{TRANSCRIPT_LANGUAGE_LABELS['auto']}（当前{TRANSCRIPT_LANGUAGE_LABELS.get(detected, detected)}）"
+    return TRANSCRIPT_LANGUAGE_LABELS.get(choice, choice)
+
+
+def configure_draft_transcripts(draft: SmartPlanDraft) -> None:
+    rows = transcript_rows_for_draft(draft)
+    if not rows:
+        print("\n没有发现可识别的台本或字幕文件。")
+        return
+    print("\n台本/字幕类型选择：")
+    print("  默认：中文台本/字幕（LRC 通常是中文翻译）")
+    print("  每份文件可选：中文、日文、英文、不使用、按文件名自动判断")
+    while True:
+        print()
+        for index, (transcript, paired_tracks) in enumerate(rows, start=1):
+            pairing = (
+                "匹配：" + "、".join(paired_tracks)
+                if paired_tracks
+                else "未匹配到当前选中的音轨"
+            )
+            print(
+                f"  {index}. {transcript.relative_path} · "
+                f"{transcript_choice_label(draft, transcript)} · {pairing}"
+            )
+        print("  0. 返回作品设置")
+        answer = input("输入编号修改这份台本，或输入 0 返回：").strip()
+        if answer == "0":
+            return
+        if not answer.isdigit() or not 1 <= int(answer) <= len(rows):
+            print("输入无效，请输入台本编号或 0。")
+            continue
+        transcript, _ = rows[int(answer) - 1]
+        print(f"\n{transcript.relative_path} 当前：{transcript_choice_label(draft, transcript)}")
+        print("  1. 中文台本/字幕（默认）")
+        print("  2. 日文台本/字幕")
+        print("  3. 英文台本/字幕")
+        print("  4. 不使用这份台本/字幕")
+        print("  5. 按文件名自动判断")
+        choice = input("输入 1-5：").strip()
+        language = {"1": "zh", "2": "ja", "3": "en", "4": "ignore", "5": "auto"}.get(choice)
+        if language is None:
+            print("输入无效，请重新选择。")
+            continue
+        draft.transcript_choices[transcript_key(transcript.path)] = language
+
+
 def prepare_smart_plan_draft(
     config: AppConfig,
     folder: Path,
@@ -3881,6 +4018,7 @@ def prepare_smart_plan_draft(
         background_choice=background_choice,
         background_relative=background_relative,
         embed_subtitles=embed_subtitles,
+        transcript_choices=default_transcript_choices(scan),
     )
 
 
@@ -3923,8 +4061,11 @@ def print_smart_plan_defaults_panel(
     print(f"  6. 视频画面：{background_draft_label(draft)}")
     subtitle_label = "内嵌，同时保留 SRT/LRC" if draft.embed_subtitles else "不内嵌，仅保留 SRT/LRC"
     print(f"  7. 视频字幕：{subtitle_label}{video_suffix}")
+    transcript_count = len(draft.scan.transcripts)
+    transcript_default = "默认中文；可逐份修改"
+    print(f"  8. 台本/字幕：发现 {transcript_count} 份，{transcript_default}")
     print(f"  输出目录：{draft.output_root}")
-    print("\n直接按 Enter：确认本作品，然后输入下一个作品路径")
+    print("\n直接按 Enter：确认本作品并返回作品串")
     print("输入 0：确认本作品，并立即开始处理全部任务")
 
 
@@ -4006,7 +4147,7 @@ def configure_smart_plan_draft(
 
     while True:
         print_smart_plan_defaults_panel(draft, config, index=index)
-        answer = input("输入 1-7 修改；直接按 Enter 添加下一个；输入 0 开始：").strip()
+        answer = input("输入 1-8 修改；直接按 Enter 返回作品串；输入 0 开始：").strip()
         if answer in {"", "0"}:
             break
         if answer == "1":
@@ -4036,18 +4177,21 @@ def configure_smart_plan_draft(
             draft.embed_subtitles = ask_yes_no(
                 "输入 Y 内嵌字幕，输入 N 仅保留外部字幕："
             )
+        elif answer == "8":
+            configure_draft_transcripts(draft)
         else:
-            print("输入无效，请输入 1-7、0，或直接按 Enter。")
+            print("输入无效，请输入 1-8、0，或直接按 Enter。")
 
     mode = normalize_mode(draft.mode)
     plan_background = draft.background if mode != MODE_AUDIO else None
     plan_embed_subtitles = draft.embed_subtitles if mode != MODE_AUDIO else False
+    effective_sources = effective_sources_for_draft(draft)
     plan_id = plan_identity(
         draft.folder,
         mode=mode,
         layout=draft.layout,
         edition=draft.edition,
-        sources=draft.sources,
+        sources=effective_sources,
         output_root=draft.output_root,
         background=plan_background,
         embed_subtitles=plan_embed_subtitles,
@@ -4056,7 +4200,7 @@ def configure_smart_plan_draft(
         folder=draft.folder,
         output_root=draft.output_root,
         edition_label=draft.edition_label,
-        sources=tuple(draft.sources),
+        sources=tuple(effective_sources),
         edition=draft.edition,
         mode=mode,
         layout=draft.layout,
@@ -4464,7 +4608,23 @@ def execute_smart_plan(
         force=force,
     )
     print_smart_plan_summary(plan)
-    execute_prepared_smart_plan(paths, config, plan)
+    try:
+        execute_prepared_smart_plan(paths, config, plan)
+    except KeyboardInterrupt:
+        raise
+    except VideoPreparerError as exc:
+        save_failed_task(plan, error=str(exc))
+        log_event(f"单作品任务失败 source={plan.folder} error={exc}")
+        raise
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        save_failed_task(plan, error=message)
+        log_event(f"单作品任务未预期失败 source={plan.folder} error={message}")
+        append_log(traceback.format_exc())
+        raise
+    else:
+        remove_failed_task(plan.plan_id)
+        remove_failed_task(plan.retry_of)
 
 
 def missing_resume_artifacts(state: dict[str, Any], folder: Path) -> list[Path]:
@@ -5031,19 +5191,25 @@ def self_test(paths: ToolPaths) -> None:
             if task.plan_id == "queue-first":
                 raise VideoPreparerError("预期的队列测试失败")
 
-        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as sink:
-            with redirect_stdout(sink), redirect_stderr(sink):
-                queue_result = execute_smart_queue(
-                    paths,
-                    AppConfig(
-                        asmr_root=None,
-                        harmonized_volume_db=-10.0,
-                        harmonized_delay_seconds=1_200,
-                        timestamp_footer="",
-                    ),
-                    queue_plans,
-                    executor=fake_queue_executor,
-                )
+        existing_failed_records = read_failed_task_records()
+        try:
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as sink:
+                with redirect_stdout(sink), redirect_stderr(sink):
+                    queue_result = execute_smart_queue(
+                        paths,
+                        AppConfig(
+                            asmr_root=None,
+                            harmonized_volume_db=-10.0,
+                            harmonized_delay_seconds=1_200,
+                            timestamp_footer="",
+                        ),
+                        queue_plans,
+                        executor=fake_queue_executor,
+                    )
+        finally:
+            # The queue test deliberately fails one item. Do not leave its
+            # temporary paths in the user's real retry list after self-test.
+            write_failed_task_records(existing_failed_records)
         if queue_result != 1 or queue_calls != ["queue-first", "queue-second"]:
             raise VideoPreparerError("自检失败：队列没有在单项失败后继续处理。")
         workspace = root / "work"
@@ -5112,7 +5278,21 @@ def self_test(paths: ToolPaths) -> None:
             "WEBVTT\n\n00:00.000 --> 00:00.500\n開場\n",
             encoding="utf-8",
         )
+        plain_lrc = catalogue_root / "字幕" / "01.lrc"
+        plain_lrc.parent.mkdir(parents=True)
+        plain_lrc.write_text("[00:00.00]中文台词\n", encoding="utf-8")
+        japanese_lrc = catalogue_root / "日文" / "line.lrc"
+        japanese_lrc.parent.mkdir(parents=True)
+        japanese_lrc.write_text("[00:00.00]日本語\n", encoding="utf-8")
         catalogue = scan_work(catalogue_root)
+        transcript_languages = {
+            item.path.resolve(): item.language for item in catalogue.transcripts
+        }
+        if (
+            transcript_languages.get(plain_lrc.resolve()) != "zh"
+            or transcript_languages.get(japanese_lrc.resolve()) != "ja"
+        ):
+            raise VideoPreparerError("自检失败：普通 LRC 或明确日文目录的语言判断错误。")
         wav_edition = next(
             (item for item in catalogue.editions if item.extension == ".wav" and item.directory == "WAV"),
             None,
@@ -5419,60 +5599,429 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def serialize_audio_source(source: AudioSource) -> dict[str, Any]:
+    return {
+        "order": source.order,
+        "path": str(source.path),
+        "title_ja": source.title_ja,
+        "size": source.size,
+        "mtime_ns": source.mtime_ns,
+        "relative_path": source.relative_path,
+        "category": source.category,
+        "transcript_path": str(source.transcript_path) if source.transcript_path else None,
+        "transcript_language": source.transcript_language,
+        "transcript_timed": source.transcript_timed,
+        "source_language": source.source_language,
+    }
+
+
+def deserialize_audio_source(payload: Any) -> AudioSource:
+    if not isinstance(payload, dict):
+        raise VideoPreparerError("失败任务记录中的音轨信息无效。")
+    transcript_text = str(payload.get("transcript_path") or "").strip()
+    return AudioSource(
+        order=int(payload.get("order") or 0),
+        path=Path(str(payload.get("path") or "")).expanduser().resolve(),
+        title_ja=str(payload.get("title_ja") or ""),
+        size=int(payload.get("size") or 0),
+        mtime_ns=int(payload.get("mtime_ns") or 0),
+        relative_path=str(payload.get("relative_path") or ""),
+        category=str(payload.get("category") or "main"),
+        transcript_path=Path(transcript_text).expanduser().resolve()
+        if transcript_text
+        else None,
+        transcript_language=str(payload.get("transcript_language") or "").strip() or None,
+        transcript_timed=bool(payload.get("transcript_timed", False)),
+        source_language=str(payload.get("source_language") or "ja"),
+    )
+
+
+def failed_task_payload(
+    plan: SmartTaskPlan,
+    *,
+    error: str | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "plan_id": plan.plan_id,
+        "retry_of": plan.retry_of,
+        "folder": str(plan.folder),
+        "output_root": str(plan.output_root),
+        "edition_label": plan.edition_label,
+        "edition": plan.edition,
+        "mode": plan.mode,
+        "layout": plan.layout,
+        "background": str(plan.background) if plan.background else None,
+        "embed_subtitles": plan.embed_subtitles,
+        "sources": [serialize_audio_source(item) for item in plan.sources],
+    }
+    if error:
+        payload["error"] = error
+    payload["failed_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    return payload
+
+
+def read_failed_task_records() -> list[dict[str, Any]]:
+    if not FAILED_TASKS_FILE.is_file():
+        return []
+    try:
+        payload = json.loads(FAILED_TASKS_FILE.read_text(encoding="utf-8"))
+        if payload.get("schema") != FAILED_TASKS_SCHEMA:
+            return []
+        records = payload.get("tasks") or []
+        return [item for item in records if isinstance(item, dict) and item.get("plan_id")]
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+
+def write_failed_task_records(records: Sequence[dict[str, Any]]) -> None:
+    if not records:
+        FAILED_TASKS_FILE.unlink(missing_ok=True)
+        return
+    atomic_write_text(
+        FAILED_TASKS_FILE,
+        json.dumps(
+            {
+                "schema": FAILED_TASKS_SCHEMA,
+                "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "tasks": list(records),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def save_failed_task(plan: SmartTaskPlan, *, error: str | None = None) -> None:
+    records = [
+        item
+        for item in read_failed_task_records()
+        if str(item.get("plan_id")) != plan.plan_id
+    ]
+    records.append(failed_task_payload(plan, error=error))
+    write_failed_task_records(records)
+
+
+def remove_failed_task(plan_id: str | None) -> None:
+    if not plan_id:
+        return
+    records = [
+        item
+        for item in read_failed_task_records()
+        if str(item.get("plan_id")) != str(plan_id)
+    ]
+    write_failed_task_records(records)
+
+
+def load_failed_task_plans() -> list[SmartTaskPlan]:
+    plans: list[SmartTaskPlan] = []
+    for record in read_failed_task_records():
+        try:
+            sources = [deserialize_audio_source(item) for item in record.get("sources") or []]
+            if not sources:
+                continue
+            plans.append(
+                SmartTaskPlan(
+                    folder=Path(str(record.get("folder") or "")).expanduser().resolve(),
+                    output_root=Path(str(record.get("output_root") or "")).expanduser().resolve(),
+                    edition_label=str(record.get("edition_label") or "失败任务"),
+                    sources=tuple(sources),
+                    edition=dict(record.get("edition") or {}),
+                    mode=normalize_mode(record.get("mode")),
+                    layout=normalize_layout(record.get("layout")),
+                    background=(
+                        Path(str(record.get("background"))).expanduser().resolve()
+                        if record.get("background")
+                        else None
+                    ),
+                    embed_subtitles=bool(record.get("embed_subtitles", True)),
+                    plan_id=str(record.get("plan_id")),
+                    rebuild=False,
+                    force=False,
+                    retry_of=str(record.get("retry_of") or "").strip() or None,
+                )
+            )
+        except (TypeError, ValueError, OSError, VideoPreparerError):
+            continue
+    return plans
+
+
+def defaults_for_failed_plan(plan: SmartTaskPlan) -> SmartPlanDefaults:
+    video_mode = plan.mode if plan.mode != MODE_AUDIO else MODE_VIDEO_NORMAL
+    edition = plan.edition
+    background_relative: str | None = None
+    if plan.background is not None:
+        try:
+            background_relative = plan.background.resolve().relative_to(
+                plan.folder.resolve()
+            ).as_posix()
+        except ValueError:
+            # A valid plan normally keeps its background inside the work folder,
+            # but retaining the basename is safer than losing the remembered
+            # choice if an older record used an external path.
+            background_relative = plan.background.name
+    return SmartPlanDefaults(
+        mode=plan.mode,
+        video_mode=video_mode,
+        layout=plan.layout,
+        include_bonus=bool(edition.get("included_optional")),
+        background_choice="black" if plan.background is None else "relative",
+        background_relative=background_relative,
+        embed_subtitles=plan.embed_subtitles,
+        edition_extension=str(edition.get("extension") or "").strip() or None,
+        edition_language=str(edition.get("language") or "").strip() or None,
+        edition_mix_variant=str(edition.get("mix_variant") or "").strip() or None,
+        edition_orientation=str(edition.get("orientation") or "").strip() or None,
+    )
+
+
+def relative_background_for_plan(plan: SmartTaskPlan) -> str | None:
+    """Return a failed plan's background relative to its work folder."""
+
+    if plan.background is None:
+        return None
+    try:
+        return plan.background.resolve().relative_to(plan.folder.resolve()).as_posix()
+    except ValueError:
+        return plan.background.name
+
+
+def work_from_failed_plan(plan: SmartTaskPlan) -> QueuedSmartWork:
+    if plan.folder.is_dir():
+        try:
+            scan = scan_work(
+                plan.folder,
+                excluded_directories=("AutoFlow输出", plan.output_root.name),
+            )
+        except Exception:
+            scan = ScanResult(plan.folder, (), (), (), (), len(plan.sources))
+    else:
+        scan = ScanResult(plan.folder, (), (), (), (), len(plan.sources))
+    choices = {
+        transcript_key(source.transcript_path): str(source.transcript_language or "zh")
+        for source in plan.sources
+        if source.transcript_path is not None
+    }
+    draft = SmartPlanDraft(
+        folder=plan.folder,
+        output_root=plan.output_root,
+        scan=scan,
+        edition_label=plan.edition_label,
+        sources=list(plan.sources),
+        edition=dict(plan.edition),
+        include_bonus=bool(plan.edition.get("included_optional")),
+        mode=plan.mode,
+        video_mode=plan.mode if plan.mode != MODE_AUDIO else MODE_VIDEO_NORMAL,
+        layout=plan.layout,
+        background=plan.background,
+        background_choice="black" if plan.background is None else "relative",
+        background_relative=relative_background_for_plan(plan),
+        embed_subtitles=plan.embed_subtitles,
+        transcript_choices=choices,
+    )
+    return QueuedSmartWork(
+        draft=draft,
+        plan=plan,
+        defaults=defaults_for_failed_plan(plan),
+    )
+
+
+def print_smart_work_queue(
+    queue: Sequence[QueuedSmartWork],
+    config: AppConfig,
+) -> None:
+    print("\n" + "=" * 68)
+    print(f"作品串（已加入 {len(queue)} 个作品）")
+    print("=" * 68)
+    for index, work in enumerate(queue, start=1):
+        plan = work.plan
+        transcript_count = len(work.draft.scan.transcripts)
+        transcript_label = (
+            f"台本/字幕 {transcript_count} 份，默认中文"
+            if transcript_count
+            else "没有台本/字幕"
+        )
+        if plan.background is None:
+            background = "黑色背景"
+        else:
+            try:
+                background = plan.background.resolve().relative_to(
+                    plan.folder.resolve()
+                ).as_posix()
+            except ValueError:
+                background = plan.background.name
+        subtitle = "内嵌字幕" if plan.embed_subtitles else "外部字幕"
+        print(
+            f"  {index}. {plan.folder.name}\n"
+            f"     {plan.edition_label} · {mode_label(plan.mode)} · "
+            f"{video_branch_label(plan.mode, config) if plan.mode != MODE_AUDIO else '音频'}\n"
+            f"     {layout_label(plan.layout)} · 背景：{background} · {subtitle} · {transcript_label}"
+        )
+    print("\n直接粘贴下一个作品路径：添加")
+    print("输入作品编号：返回修改；输入 D+编号：删除；直接按 Enter：开始处理")
+
+
+def _queue_index(value: str, maximum: int) -> int | None:
+    raw = value.strip()
+    if raw.casefold().startswith("d") or raw.casefold().startswith("e"):
+        raw = raw[1:].strip()
+    if not raw.isdigit():
+        return None
+    index = int(raw)
+    return index if 1 <= index <= maximum else None
+
+
+def _prefixed_queue_index(value: str, prefix: str, maximum: int) -> int | None:
+    match = re.fullmatch(rf"{re.escape(prefix)}\s*(\d+)", value.strip(), re.IGNORECASE)
+    if match is None:
+        return None
+    index = int(match.group(1))
+    return index if 1 <= index <= maximum else None
+
+
 def collect_interactive_smart_plans(
     config: AppConfig,
     args: argparse.Namespace,
 ) -> list[SmartTaskPlan]:
-    """Configure every queued work before the first one starts processing."""
+    """Configure a visible, editable queue before the first task starts."""
 
-    plans: list[SmartTaskPlan] = []
+    queue: list[QueuedSmartWork] = []
     configured_folders: set[Path] = set()
     defaults = load_smart_plan_defaults(config)
+    failed_available = load_failed_task_plans()
     if LAST_OPTIONS_FILE.is_file():
         print("已载入上次使用的默认选项；每个作品都可以单独修改。")
+
     while True:
-        number = len(plans) + 1
-        prompt = f"请粘贴第 {number} 个作品文件夹路径"
-        if plans:
-            prompt += "；直接按 Enter 开始处理已有队列"
-        raw_path = input(prompt + "：").strip()
-        if not raw_path:
-            if plans:
+        if queue:
+            print_smart_work_queue(queue, config)
+        if failed_available:
+            print("\n上次失败、可重新开始的任务：")
+            failed_records = {
+                str(item.get("plan_id")): item for item in read_failed_task_records()
+            }
+            for index, plan in enumerate(failed_available, start=1):
+                reason = str(
+                    failed_records.get(plan.plan_id, {}).get("error") or ""
+                ).strip()
+                suffix = f" · {reason}" if reason else ""
+                print(f"  F{index}. {plan.folder} · {mode_label(plan.mode)}{suffix}")
+        if queue:
+            prompt = "请粘贴下一个作品路径；输入编号修改、D+编号删除、F+编号重试、X+编号丢弃失败记录，或直接按 Enter 开始："
+        elif failed_available:
+            prompt = "请粘贴新作品路径；输入 F+编号加入重试、X+编号丢弃失败记录："
+        else:
+            prompt = "请粘贴第一个作品文件夹路径："
+        raw = input(prompt).strip()
+
+        if not raw:
+            if queue:
                 break
             print("还没有添加作品，请先输入一个文件夹路径。")
             continue
+
+        failed_index = _prefixed_queue_index(raw, "f", len(failed_available))
+        if failed_index is not None:
+            failed_plan = failed_available.pop(failed_index - 1)
+            if failed_plan.folder.resolve() in configured_folders:
+                print("这个作品已经在作品串中。")
+                failed_available.insert(failed_index - 1, failed_plan)
+                continue
+            work = work_from_failed_plan(failed_plan)
+            work.plan = replace(work.plan, retry_of=failed_plan.plan_id)
+            queue.append(work)
+            configured_folders.add(work.plan.folder.resolve())
+            defaults = work.defaults
+            continue
+
+        discard_index = _prefixed_queue_index(raw, "x", len(failed_available))
+        if discard_index is not None:
+            failed_plan = failed_available.pop(discard_index - 1)
+            if ask_yes_no(
+                f"确定丢弃失败记录“{failed_plan.folder.name}”？输入 Y 丢弃，输入 N 保留："
+            ):
+                remove_failed_task(failed_plan.plan_id)
+                print("已丢弃失败记录。")
+            else:
+                failed_available.insert(discard_index - 1, failed_plan)
+            continue
+
+        if queue:
+            edit_index = _queue_index(raw, len(queue))
+            command = raw.casefold()
+            if command.startswith(("d", "e")) or raw.isdigit():
+                if edit_index is None:
+                    print("作品编号无效，请重新输入。")
+                    continue
+                if command.startswith("d"):
+                    if not ask_yes_no(
+                        f"确定从作品串删除第 {edit_index} 项“{queue[edit_index - 1].plan.folder.name}”？输入 Y 删除，输入 N 保留："
+                    ):
+                        continue
+                    queue.pop(edit_index - 1)
+                    configured_folders = {work.plan.folder.resolve() for work in queue}
+                    if queue:
+                        defaults = queue[-1].defaults
+                        save_smart_plan_defaults(defaults)
+                    print("已从作品串删除。")
+                    continue
+
+                work = queue[edit_index - 1]
+                old_plan_id = work.plan.plan_id
+                plan, edited_defaults, start_now = configure_smart_plan_draft(
+                    work.draft,
+                    config,
+                    index=edit_index,
+                    rebuild=args.rebuild,
+                    force=args.force,
+                )
+                failed_ids = {item.plan_id for item in load_failed_task_plans()}
+                if old_plan_id in failed_ids:
+                    retry_of = work.plan.retry_of or old_plan_id
+                else:
+                    retry_of = work.plan.retry_of
+                work.plan = replace(plan, retry_of=retry_of)
+                work.defaults = edited_defaults
+                if edit_index == len(queue):
+                    defaults = edited_defaults
+                    save_smart_plan_defaults(defaults)
+                if start_now:
+                    break
+                continue
+
         try:
-            folder = clean_user_path(raw_path)
+            folder = clean_user_path(raw)
         except VideoPreparerError as exc:
             print(f"路径无效：{exc}")
             continue
         resolved = folder.resolve()
         if resolved in configured_folders:
-            print("这个作品已经在任务列表中，请换一个文件夹。")
+            print("这个作品已经在作品串中，请换一个文件夹。")
             continue
         try:
             draft = prepare_smart_plan_draft(config, folder, defaults, args)
         except VideoPreparerError as exc:
             print(f"无法配置这个作品：{exc}")
             continue
-        plan, defaults, start_now = configure_smart_plan_draft(
+        plan, work_defaults, start_now = configure_smart_plan_draft(
             draft,
             config,
-            index=number,
+            index=len(queue) + 1,
             rebuild=args.rebuild,
             force=args.force,
         )
-        if any(existing.output_root == plan.output_root for existing in plans):
-            raise VideoPreparerError(
-                f"两个作品不能使用同一个输出目录：{plan.output_root}"
-            )
-        plans.append(plan)
+        if any(existing.plan.output_root == plan.output_root for existing in queue):
+            print(f"这个输出目录已经被队列中的其他作品使用：{plan.output_root}")
+            continue
+        queue.append(QueuedSmartWork(draft=draft, plan=plan, defaults=work_defaults))
         configured_folders.add(resolved)
+        defaults = work_defaults
         save_smart_plan_defaults(defaults)
-        print(f"\n已加入队列：{plan.folder.name}")
+        print(f"\n已加入作品串：{plan.folder.name}")
         if start_now:
             break
-    return plans
+    return [work.plan for work in queue]
 
 
 def execute_smart_queue(
@@ -5493,11 +6042,16 @@ def execute_smart_queue(
         print("=" * 68)
         try:
             run_plan(paths, config, plan)
+            remove_failed_task(plan.plan_id)
+            remove_failed_task(plan.retry_of)
         except KeyboardInterrupt:
             raise
         except VideoPreparerError as exc:
             message = str(exc)
             failures.append((plan, message))
+            save_failed_task(plan, error=message)
+            if plan.retry_of and plan.retry_of != plan.plan_id:
+                remove_failed_task(plan.retry_of)
             log_event(
                 f"队列任务失败 source={plan.folder} error={message}；继续下一项"
             )
@@ -5506,6 +6060,9 @@ def execute_smart_queue(
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             failures.append((plan, message))
+            save_failed_task(plan, error=message)
+            if plan.retry_of and plan.retry_of != plan.plan_id:
+                remove_failed_task(plan.retry_of)
             log_event(
                 f"队列任务未预期失败 source={plan.folder} error={message}；继续下一项"
             )
