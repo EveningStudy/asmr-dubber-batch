@@ -1,5 +1,7 @@
 # ASMR-Dubber AutoFlow
 
+本工具已集成到 [asmr-dubber](https://github.com/EveningStudy/asmr-dubber) 最新版本中。
+
 [ASMR Dubber 主项目：音频识别、翻译、配音与双语字幕制作](https://github.com/EveningStudy/ASMR-Dubber)
 
 ASMR-Dubber AutoFlow 是 [ASMR Dubber](https://github.com/EveningStudy/ASMR-Dubber) 的批处理助手。给它一个解压后的 DLsite 音声文件夹，它会找出可用音轨、让你确认版本和输出方式，然后依次完成 ASR（语音识别）、翻译、TTS（语音合成）、混音、字幕和视频输出。
